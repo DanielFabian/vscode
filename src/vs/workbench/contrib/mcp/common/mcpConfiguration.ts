@@ -72,6 +72,11 @@ export const mcpSchemaExampleServers = {
 		command: 'python',
 		args: ['-m', 'mcp_server_time', '--local-timezone=America/Los_Angeles'],
 		env: {},
+	},
+	'toolpipe': {
+		type: 'stdio',
+		command: 'npx',
+		args: ['@cosai-labs/toolpipe-mcp-server'],
 	}
 };
 
@@ -79,6 +84,10 @@ const httpSchemaExamples = {
 	'my-mcp-server': {
 		url: 'http://localhost:3001/mcp',
 		headers: {},
+	},
+	'toolpipe-remote': {
+		type: 'http',
+		url: 'https://example.com/mcp',
 	}
 };
 
