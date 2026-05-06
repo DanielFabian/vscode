@@ -17,6 +17,10 @@ import { InstantiationService } from '../../../instantiation/common/instantiatio
 import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
 import { ILogService, NullLogService } from '../../../log/common/log.js';
 import { AgentSession, type AgentSignal, type IAgentActionSignal, type IAgentToolPendingConfirmationSignal } from '../../common/agentService.js';
+import { AgentHostGenAiAttr, AgentHostOTelAttr } from '../../common/otel/agentHostOTelAttributes.js';
+import { InMemoryAgentHostOTelService } from '../../common/otel/inMemoryAgentHostOTelService.js';
+import { NoopAgentHostOTelService } from '../../common/otel/noopAgentHostOTelService.js';
+import { AgentHostSpanStatusCode, IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
 import { IDiffComputeService } from '../../common/diffComputeService.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
 import { ActionType, type SessionDeltaAction, type SessionErrorAction, type SessionInputRequestedAction, type SessionResponsePartAction, type SessionToolCallCompleteAction, type SessionToolCallReadyAction, type SessionToolCallStartAction } from '../../common/state/sessionActions.js';
@@ -143,6 +147,7 @@ async function createAgentSession(disposables: DisposableStore, options?: {
 	workingDirectory?: URI;
 	/** Per-key effective config values returned by the fake configuration service. */
 	configValues?: Record<string, unknown>;
+	otelService?: IAgentHostOTelService;
 }): Promise<{
 	session: CopilotAgentSession;
 	mockSession: MockCopilotSession;
@@ -190,6 +195,7 @@ async function createAgentSession(disposables: DisposableStore, options?: {
 	services.set(IFileService, { _serviceBrand: undefined } as IFileService);
 	services.set(ISessionDataService, createSessionDataService());
 	services.set(IDiffComputeService, createZeroDiffComputeService());
+	services.set(IAgentHostOTelService, options?.otelService ?? NoopAgentHostOTelService.INSTANCE);
 	const sessionConfigUpdates: Array<{ session: string; patch: Record<string, unknown> }> = [];
 	const configValues = options?.configValues ?? {};
 	const fakeConfigurationService: IAgentConfigurationService = {
@@ -262,6 +268,151 @@ suite('CopilotAgentSession', () => {
 				{ type: 'selection', filePath: selectionUri.fsPath, displayName: 'selection.ts', text: undefined, selection: undefined },
 			],
 		}]);
+	});
+
+	test('emits an agent invocation span for a completed turn', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: false,
+			captureContent: false,
+			maxAttributeSizeChars: 1024,
+		}));
+		const completed = new DeferredPromise<void>();
+		const spans: string[] = [];
+		disposables.add(otelService.onDidCompleteSpan(span => {
+			spans.push(span.name);
+			if (span.name === 'invoke_agent copilotcli') {
+				assert.deepStrictEqual(
+					{
+						name: span.name,
+						operation: span.attributes[AgentHostGenAiAttr.OPERATION_NAME],
+						provider: span.attributes[AgentHostOTelAttr.PROVIDER],
+						sessionId: span.attributes[AgentHostOTelAttr.SESSION_ID],
+						turnId: span.attributes[AgentHostOTelAttr.TURN_ID],
+						status: span.status.code,
+					},
+					{
+						name: 'invoke_agent copilotcli',
+						operation: 'invoke_agent',
+						provider: 'copilotcli',
+						sessionId: 'test-session-1',
+						turnId: 'turn-1',
+						status: AgentHostSpanStatusCode.OK,
+					},
+				);
+				completed.complete();
+			}
+		}));
+		const { session, mockSession } = await createAgentSession(disposables, { otelService });
+
+		await session.send('hello', undefined, 'turn-1', 'interactive');
+		mockSession.fire('assistant.turn_end', { turnId: 'turn-1' });
+		mockSession.fire('hook.start', { hookType: 'sessionEnd', hookInvocationId: 'hook-1', input: {} });
+		mockSession.fire('hook.end', { hookType: 'sessionEnd', hookInvocationId: 'hook-1', success: true, output: undefined });
+		await completed.p;
+
+		assert.deepStrictEqual(spans.includes('invoke_agent copilotcli'), true);
+	});
+
+	test('emits captured input messages as GenAI message JSON', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: false,
+			captureContent: true,
+			maxAttributeSizeChars: 1024,
+		}));
+		const completed = new DeferredPromise<string | undefined>();
+		disposables.add(otelService.onDidCompleteSpan(span => {
+			if (span.name === 'invoke_agent copilotcli') {
+				completed.complete(span.attributes[AgentHostGenAiAttr.INPUT_MESSAGES] as string | undefined);
+			}
+		}));
+		const { session, mockSession } = await createAgentSession(disposables, { otelService });
+
+		await session.send('hello', undefined, 'turn-1', 'interactive');
+		mockSession.fire('assistant.turn_end', { turnId: 'turn-1' });
+		mockSession.fire('hook.start', { hookType: 'sessionEnd', hookInvocationId: 'hook-1', input: {} });
+		mockSession.fire('hook.end', { hookType: 'sessionEnd', hookInvocationId: 'hook-1', success: true, output: undefined });
+
+		assert.deepStrictEqual(JSON.parse(await completed.p ?? ''), [{ role: 'user', content: 'hello' }]);
+	});
+
+	test('parents post-turn hooks under the agent invocation span', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: false,
+			captureContent: false,
+			maxAttributeSizeChars: 1024,
+		}));
+		const completed = new DeferredPromise<void>();
+		const spans: Array<{ name: string; spanId: string; parentSpanId: string | undefined }> = [];
+		disposables.add(otelService.onDidCompleteSpan(span => {
+			spans.push({ name: span.name, spanId: span.spanId, parentSpanId: span.parentSpanId });
+			if (span.name === 'invoke_agent copilotcli') {
+				completed.complete();
+			}
+		}));
+		const { session, mockSession } = await createAgentSession(disposables, { otelService });
+
+		await session.send('hello', undefined, 'turn-1', 'interactive');
+		mockSession.fire('assistant.turn_end', { turnId: 'turn-1' });
+		mockSession.fire('hook.start', { hookType: 'agentStop', hookInvocationId: 'hook-agent-stop', input: {} });
+		mockSession.fire('hook.end', { hookType: 'agentStop', hookInvocationId: 'hook-agent-stop', success: true, output: undefined });
+		mockSession.fire('hook.start', { hookType: 'sessionEnd', hookInvocationId: 'hook-session-end', input: {} });
+		mockSession.fire('hook.end', { hookType: 'sessionEnd', hookInvocationId: 'hook-session-end', success: true, output: undefined });
+		await completed.p;
+
+		const agentSpan = spans.find(span => span.name === 'invoke_agent copilotcli');
+		assert.ok(agentSpan);
+		assert.deepStrictEqual(spans.filter(span => span.name.startsWith('execute_hook ')).map(span => ({
+			name: span.name,
+			parentSpanId: span.parentSpanId,
+		})), [
+			{ name: 'execute_hook agentStop', parentSpanId: agentSpan.spanId },
+			{ name: 'execute_hook sessionEnd', parentSpanId: agentSpan.spanId },
+		]);
+	});
+
+	test('emits contextual verbose spans for SDK calls during a turn', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: true,
+			captureContent: false,
+			maxAttributeSizeChars: 1024,
+		}));
+		const completed = new DeferredPromise<void>();
+		const spans: Array<{ name: string; spanId: string; parentSpanId: string | undefined; sdkCall: unknown; sdkReason: unknown }> = [];
+		disposables.add(otelService.onDidCompleteSpan(span => {
+			spans.push({
+				name: span.name,
+				spanId: span.spanId,
+				parentSpanId: span.parentSpanId,
+				sdkCall: span.attributes[AgentHostOTelAttr.SDK_CALL],
+				sdkReason: span.attributes[AgentHostOTelAttr.SDK_REASON],
+			});
+			if (span.name === 'invoke_agent copilotcli') {
+				completed.complete();
+			}
+		}));
+		const { session, mockSession } = await createAgentSession(disposables, { otelService });
+
+		await session.send('hello', undefined, 'turn-1', 'interactive');
+		mockSession.fire('assistant.turn_end', { turnId: 'turn-1' });
+		mockSession.fire('hook.start', { hookType: 'sessionEnd', hookInvocationId: 'hook-session-end', input: {} });
+		mockSession.fire('hook.end', { hookType: 'sessionEnd', hookInvocationId: 'hook-session-end', success: true, output: undefined });
+		await completed.p;
+
+		const agentSpan = spans.find(span => span.name === 'invoke_agent copilotcli');
+		assert.ok(agentSpan);
+		assert.deepStrictEqual(spans.filter(span => span.name.startsWith('vscode_agent_host.sdk.')).map(span => ({
+			name: span.name,
+			parentSpanId: span.parentSpanId,
+			sdkCall: span.sdkCall,
+			sdkReason: span.sdkReason,
+		})), [
+			{ name: 'vscode_agent_host.sdk.session.rpc.mode.set', parentSpanId: agentSpan.spanId, sdkCall: 'session.rpc.mode.set', sdkReason: 'apply_chat_mode' },
+			{ name: 'vscode_agent_host.sdk.session.send', parentSpanId: agentSpan.spanId, sdkCall: 'session.send', sdkReason: 'user_turn' },
+		]);
 	});
 
 	// ---- permission handling ----

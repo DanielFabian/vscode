@@ -29,6 +29,8 @@ import { MockAgent, ScriptedMockAgent } from './mockAgent.js';
 import { mapSessionEventsToHistoryRecords } from './historyRecordFixtures.js';
 import { type ISessionEvent } from '../../node/copilot/mapSessionEvents.js';
 import { createNoopGitService, createSessionDataService } from '../common/sessionTestHelpers.js';
+import { NoopAgentHostOTelService } from '../../common/otel/noopAgentHostOTelService.js';
+import type { AgentHostTraceContext } from '../../common/otel/agentHostTraceContext.js';
 
 /**
  * Loads a JSONL fixture of raw Copilot SDK events, runs them through
@@ -52,6 +54,15 @@ async function loadFixtureMessages(fixtureName: string, session: URI) {
 	const raw = readFileSync(`${fixtureDir}${sep}test-cases${sep}${fixtureName}`, 'utf-8');
 	const events: ISessionEvent[] = raw.trim().split('\n').map(line => JSON.parse(line));
 	return mapSessionEventsToHistoryRecords(session, undefined, events);
+}
+
+class CapturingAgentHostOTelService extends NoopAgentHostOTelService {
+	contexts: AgentHostTraceContext[] = [];
+
+	override runWithTraceContext<T>(traceContext: AgentHostTraceContext, fn: () => T): T {
+		this.contexts.push(traceContext);
+		return fn();
+	}
 }
 
 suite('AgentService (node dispatcher)', () => {
@@ -168,6 +179,24 @@ suite('AgentService (node dispatcher)', () => {
 			} finally {
 				rmSync(tempDir.fsPath, { recursive: true, force: true });
 			}
+		});
+
+		test('runs client-dispatched actions with supplied trace context', () => {
+			const otelService = new CapturingAgentHostOTelService();
+			const svc = disposables.add(new AgentService(new NullLogService(), fileService, nullSessionDataService, { _serviceBrand: undefined } as IProductService, createNoopGitService(), undefined, otelService));
+			const traceContext: AgentHostTraceContext = {
+				traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+				spanId: '00f067aa0ba902b7',
+				traceFlags: 1,
+				traceState: 'vendor=value',
+			};
+
+			svc.dispatchAction({
+				type: ActionType.RootConfigChanged,
+				config: { permissions: { allow: ['read'], deny: [] } },
+			}, 'test-client', 1, { traceContext });
+
+			assert.deepStrictEqual(otelService.contexts, [traceContext]);
 		});
 	});
 

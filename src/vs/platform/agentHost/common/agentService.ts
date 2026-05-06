@@ -11,6 +11,8 @@ import { URI } from '../../../base/common/uri.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import type { ISyncedCustomization } from './agentPluginManager.js';
 import type { IAgentSubscription } from './state/agentSubscription.js';
+import type { AgentHostCompletedSpan } from './otel/agentHostOTelService.js';
+import type { AgentHostTraceContext } from './otel/agentHostTraceContext.js';
 import type { CompletionsParams, CompletionsResult, CreateTerminalParams, ResolveSessionConfigResult, SessionConfigCompletionsResult } from './state/protocol/commands.js';
 import { ProtectedResourceMetadata, type ConfigSchema, type FileEdit, type ModelSelection, type SessionActiveClient, type ToolCallPendingConfirmationState, type ToolDefinition } from './state/protocol/state.js';
 import type { ActionEnvelope, INotification, IRootConfigChangedAction, SessionAction, TerminalAction } from './state/sessionActions.js';
@@ -43,6 +45,21 @@ export const AgentHostIpcLoggingSettingId = 'chat.agentHost.ipcLoggingEnabled';
  * host process must be restarted for changes to take effect.
  */
 export const AgentHostClaudeAgentEnabledSettingId = 'chat.agentHost.claudeAgent.enabled';
+
+/** Enables OpenTelemetry export from the agent host process. Requires an agent host restart. */
+export const AgentHostOTelEnabledSettingId = 'chat.agentHost.otel.enabled';
+
+/** Enables verbose frontend-to-agent trace spans. Requires an agent host restart for provider-side changes. */
+export const AgentHostOTelVerboseTracingSettingId = 'chat.agentHost.otel.verboseTracing';
+
+/** Includes prompt/tool content in Agent Host OTel attributes. Requires an agent host restart. */
+export const AgentHostOTelCaptureContentSettingId = 'chat.agentHost.otel.captureContent';
+
+/** OTLP/HTTP traces endpoint used by the agent host process. Requires an agent host restart. */
+export const AgentHostOTelEndpointSettingId = 'chat.agentHost.otel.otlpEndpoint';
+
+/** Maximum length for Agent Host OTel string attributes. Requires an agent host restart. */
+export const AgentHostOTelMaxAttributeSizeSettingId = 'chat.agentHost.otel.maxAttributeSizeChars';
 
 /**
  * Environment variable that, when set to `'1'`, causes the agent host process to
@@ -136,6 +153,10 @@ export interface IAgentCreateSessionResult {
 	 * has been persisted.
 	 */
 	readonly provisional?: boolean;
+}
+
+export interface IAgentDispatchOptions {
+	readonly traceContext?: AgentHostTraceContext;
 }
 
 /**
@@ -585,7 +606,7 @@ export interface IAgentService {
 	listSessions(): Promise<IAgentSessionMetadata[]>;
 
 	/** Create a new session. Returns the session URI. */
-	createSession(config?: IAgentCreateSessionConfig): Promise<URI>;
+	createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI>;
 
 	/** Resolve the dynamic configuration schema for creating a session. */
 	resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult>;
@@ -659,7 +680,14 @@ export interface IAgentService {
 	 * it to state, triggers side effects, and echoes it back via
 	 * {@link onDidAction} with the client's origin for reconciliation.
 	 */
-	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number): void;
+	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number, options?: IAgentDispatchOptions): void;
+
+	/**
+	 * Export a completed span produced by a client process through the agent
+	 * host's server-side exporter. This avoids browser CORS restrictions on
+	 * OTLP/HTTP collectors.
+	 */
+	emitOTelSpan(span: AgentHostCompletedSpan): void;
 
 	/**
 	 * List the contents of a directory on the agent host's filesystem.
@@ -712,7 +740,7 @@ export interface IAgentConnection {
 	getSubscriptionUnmanaged<T extends StateComponents>(kind: T, resource: URI): IAgentSubscription<ComponentToState[T]> | undefined;
 
 	// ---- Action dispatch ----------------------------------------------------
-	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction): void;
+	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction, options?: IAgentDispatchOptions): void;
 
 	// ---- Events (connection-level) ------------------------------------------
 	readonly onDidNotification: Event<INotification>;
@@ -721,7 +749,7 @@ export interface IAgentConnection {
 	// ---- Session lifecycle --------------------------------------------------
 	authenticate(params: AuthenticateParams): Promise<AuthenticateResult>;
 	listSessions(): Promise<IAgentSessionMetadata[]>;
-	createSession(config?: IAgentCreateSessionConfig): Promise<URI>;
+	createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI>;
 	resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult>;
 	sessionConfigCompletions(params: IAgentSessionConfigCompletionsParams): Promise<SessionConfigCompletionsResult>;
 	completions(params: CompletionsParams): Promise<CompletionsResult>;
@@ -765,6 +793,9 @@ export interface IAgentHostService extends IAgentConnection {
 
 	/** Update {@link authenticationPending}. Internal — only the auth driver should call this. */
 	setAuthenticationPending(pending: boolean): void;
+
+	/** Forward a client-produced span to the agent host's OTel exporter. */
+	emitOTelSpan(span: AgentHostCompletedSpan): void;
 
 	restartAgentHost(): Promise<void>;
 

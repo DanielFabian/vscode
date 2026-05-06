@@ -17,6 +17,7 @@ The extension has four agent execution paths, each with different OTel strategie
 | **Copilot CLI in-process** | Extension host (same process) | **Bridge SpanProcessor** — SDK creates spans natively; bridge forwards to debug panel | SDK native spans via bridge |
 | **Copilot CLI terminal** | Separate terminal process | Forward OTel env vars | N/A (separate process) |
 | **Claude Code** | Child process (Node fork) | **Synthesized from SDK messages** — extension intercepts the Claude SDK message stream in `claudeMessageDispatch.ts` and emits GenAI spans; LLM calls are proxied through `claudeLanguageModelServer.ts` (which calls `chatMLFetcher`, producing standard `chat` spans). | Extension spans |
+| **Agent Host Copilot CLI** | Agent host process, optionally parented from workbench, plus spawned Copilot SDK/CLI process | Dependency-free Agent Host OTel service exports provider spans; the Agent Host configures SDK/CLI OTel for native request/tool spans; verbose mode emits workbench spans and propagates W3C trace context through the provider into the SDK/CLI | Agent Host spans + SDK native spans |
 
 > **Why asymmetric?** The CLI SDK runs in-process with full trace hierarchy (subagents, permissions, hooks). A bridge captures this directly. Claude runs as a separate process — internal spans are inaccessible, so the extension synthesizes spans by translating SDK messages and proxying the model API.
 
@@ -76,6 +77,35 @@ invoke_agent (CLIENT)                    ← standalone copilot binary
 ├── chat gpt-4o (CLIENT)
 └── (independent root traces, no extension link)
 ```
+
+#### Agent Host Copilot CLI
+
+```
+chat.agent_host.invoke (INTERNAL, verbose only)      <- workbench
+└── chat.agent_host.turn (INTERNAL, verbose only)    <- workbench
+    └── traceparent metadata on dispatchAction
+        └── invoke_agent copilotcli (INTERNAL)       <- agent host process
+            └── traceparent via CopilotClientOptions.onGetTraceContext
+                ├── invoke_agent (CLIENT)            <- spawned SDK/CLI native OTel
+                ├── chat claude-opus-4.6-1m (CLIENT)
+                ├── execute_tool bash (INTERNAL)
+                ├── execute_hook PreToolUse (INTERNAL)
+                └── permission / subagent spans
+```
+
+The Agent Host implementation deliberately does not require an AHP schema change for trace propagation. Workbench and remote clients pass trace context as VS Code implementation metadata (`IAgentDispatchOptions` locally and extended `createSession` / `dispatchAction` params over the remote transport). `ProtocolServerHandler` parses W3C `traceparent`/`tracestate`; `AgentService.createSession` and `AgentService.dispatchAction` run provider work and reducer side effects inside that context, which parents provider spans to the frontend trace when verbose tracing is enabled.
+
+When `chat.agentHost.otel.enabled` is true, the Agent Host also passes `CopilotClientOptions.telemetry` to the `@github/copilot-sdk` client. That causes the spawned Copilot CLI process to enable its native OTel exporter, so request-level `chat` spans and CLI-native tool/hook spans appear in the same trace. The Agent Host `CopilotClientOptions.onGetTraceContext` callback returns the active W3C trace context so SDK/CLI spans are correlated with the provider span, and with frontend spans when verbose tracing is enabled. The Node Agent Host service uses async-local trace context storage so overlapping async operations do not clobber each other. Because SDK trace-context callbacks can happen after the initial `session.send()` call has returned, the callback falls back to the active `invoke_agent copilotcli` span until the agent invocation fully finishes, including post-turn hooks such as `agentStop` and `sessionEnd`, but only when exactly one session has an active agent span; ambiguous concurrent sessions intentionally do not guess.
+
+The chat turn trace context is also threaded through host lifecycle work that can be triggered by the first message: `createSession`, `SessionConfigChanged`, `SessionActiveClientChanged`, and the provider's materialization callback. Without those explicit links, spans such as `vscode_agent_host.create_session` or `vscode_agent_host.db.persist_config_values` can appear as disconnected top-level traces even though they were caused by the same chat submission.
+
+Workbench spans are not exported directly from the browser process. Browser OTLP/HTTP posts fail against common local collectors because they do not include CORS headers, so `BrowserAgentHostOTelService` forwards completed workbench spans over the Agent Host IPC service and the Agent Host process exports them with the same server-side exporter as provider spans.
+
+When the Copilot SDK calls an Agent Host-owned tool, the SDK includes the W3C trace context for its native `execute_tool` span on the `ToolInvocation` (`traceparent` / `tracestate`). Agent Host shell tools consume that context and emit `vscode_agent_host.tool_handler <tool>` spans as children of the SDK `execute_tool` span, so host-side execution details can be correlated with SDK-native tool spans.
+
+With `chat.agentHost.otel.verboseTracing`, the Agent Host also emits VS Code-specific internal spans for lifecycle and persistence work that is outside the SDK's GenAI spans: `vscode_agent_host.create_session`, `vscode_agent_host.list_sessions`, `vscode_agent_host.materialize_provisional`, and grouped `vscode_agent_host.db.*` spans. These spans intentionally use `vscode_agent_host.*` attributes rather than GenAI message attributes so collector GenAI visualizers only parse actual request/message payloads. High-cardinality session metadata reads are batched under a single list-session DB span instead of emitting one exported span per session.
+
+Verbose tracing also wraps every host-owned call into `@github/copilot-sdk` with a `vscode_agent_host.sdk.*` span. These spans carry `vscode_agent_host.sdk.call` and `vscode_agent_host.sdk.reason` so a trace shows both the SDK API (`session.send`, `client.resume_session`, `session.rpc.plan.read`, etc.) and the host-side reason for making the call (`user_turn`, `resume_cached_session`, `exit_plan_mode_request`, etc.). Product code uses the typed descriptors and callback helpers in `agentHostOTelTracing.ts` instead of constructing these span names, attributes, and error handling inline; the workbench `chat.agent_host.*` spans use the same helper path.
 
 #### Claude Code (synthesized from SDK messages)
 
@@ -153,6 +183,12 @@ src/extension/trajectory/vscode-node/
 | `copilotCliBridgeSpanProcessor.ts` | Bridge: SDK `ReadableSpan` → `ICompletedSpanData` (with hook-span enrichment) |
 | `copilotcliSessionService.ts` | Bridge installation + OTel env vars for SDK |
 | `copilotCLITerminalIntegration.ts` | OTel env vars forwarded to terminal process |
+| `src/vs/platform/agentHost/common/otel/*` | Agent Host OTel service contract, trace context helpers, GenAI attributes, and OTLP JSON serialization |
+| `src/vs/platform/agentHost/node/otel/*` | Agent Host process config and OTLP/HTTP exporter service |
+| `src/vs/platform/agentHost/node/agentService.ts` | Verbose Agent Host lifecycle spans for listing, creating, materializing, and restoring sessions |
+| `src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts` | Agent Host `invoke_agent copilotcli`, `execute_tool`, `execute_hook`, permission, subagent, and turn events |
+| `src/vs/platform/agentHost/node/copilot/copilotAgent.ts` | Verbose Copilot provider spans for provisional materialization and session metadata database operations |
+| `src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts` | Verbose workbench spans and trace context propagation from chat turn dispatch |
 | `claudeOTelTracker.ts` | `invoke_agent claude` span + per-session token/cost accumulation |
 | `claudeMessageDispatch.ts` | `execute_tool` and `execute_hook` spans for the Claude agent (incl. subagent nesting) |
 | `claudeLanguageModelServer.ts` | Wraps Claude → CAPI proxy requests in the active trace context (chat spans come from `chatMLFetcher`) |

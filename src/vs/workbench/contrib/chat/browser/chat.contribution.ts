@@ -9,7 +9,7 @@ import { Schemas } from '../../../../base/common/network.js';
 import { isMacintosh } from '../../../../base/common/platform.js';
 import { PolicyCategory } from '../../../../base/common/policy.js';
 import { CopilotSessionSearchPolicy } from '../../../../base/common/defaultAccount.js';
-import { AgentHostClaudeAgentEnabledSettingId, AgentHostEnabledSettingId, AgentHostIpcLoggingSettingId } from '../../../../platform/agentHost/common/agentService.js';
+import { AgentHostClaudeAgentEnabledSettingId, AgentHostEnabledSettingId, AgentHostIpcLoggingSettingId, AgentHostOTelCaptureContentSettingId, AgentHostOTelEnabledSettingId, AgentHostOTelEndpointSettingId, AgentHostOTelMaxAttributeSizeSettingId, AgentHostOTelVerboseTracingSettingId } from '../../../../platform/agentHost/common/agentService.js';
 import { AgentNetworkFilterService, IAgentNetworkFilterService } from '../../../../platform/networkFilter/common/networkFilterService.js';
 import { AgentNetworkDomainSettingId } from '../../../../platform/networkFilter/common/settings.js';
 import { AgentSandboxEnabledValue, AgentSandboxSettingId } from '../../../../platform/sandbox/common/settings.js';
@@ -997,6 +997,42 @@ configurationRegistry.registerConfiguration({
 			type: 'boolean',
 			description: nls.localize('chat.agentHost.ipcLogging', "When enabled, logs all IPC traffic for each agent host to a dedicated output channel."),
 			default: product.quality !== 'stable',
+			tags: ['experimental', 'advanced'],
+			included: product.quality !== 'stable',
+		},
+		[AgentHostOTelEnabledSettingId]: {
+			type: 'boolean',
+			description: nls.localize('chat.agentHost.otel.enabled', "When enabled, the agent host exports OpenTelemetry traces for agent execution. The agent host process must be restarted for changes to this setting to take effect."),
+			default: false,
+			tags: ['experimental', 'advanced'],
+			included: product.quality !== 'stable',
+		},
+		[AgentHostOTelVerboseTracingSettingId]: {
+			type: 'boolean',
+			description: nls.localize('chat.agentHost.otel.verboseTracing', "When enabled, agent host OpenTelemetry traces include verbose frontend-to-agent spans. Requires `#chat.agentHost.otel.enabled#`. The agent host process must be restarted for provider-side changes to this setting to take effect."),
+			default: false,
+			tags: ['experimental', 'advanced'],
+			included: product.quality !== 'stable',
+		},
+		[AgentHostOTelCaptureContentSettingId]: {
+			type: 'boolean',
+			description: nls.localize('chat.agentHost.otel.captureContent', "When enabled, agent host OpenTelemetry traces may include prompt, tool argument, and tool result content. The agent host process must be restarted for changes to this setting to take effect."),
+			default: false,
+			tags: ['experimental', 'advanced'],
+			included: product.quality !== 'stable',
+		},
+		[AgentHostOTelEndpointSettingId]: {
+			type: 'string',
+			description: nls.localize('chat.agentHost.otel.otlpEndpoint', "OTLP/HTTP traces endpoint used by the agent host process. The agent host process must be restarted for changes to this setting to take effect."),
+			default: '',
+			tags: ['experimental', 'advanced'],
+			included: product.quality !== 'stable',
+		},
+		[AgentHostOTelMaxAttributeSizeSettingId]: {
+			type: 'number',
+			description: nls.localize('chat.agentHost.otel.maxAttributeSizeChars', "Maximum length for string attributes exported by agent host OpenTelemetry tracing. The agent host process must be restarted for changes to this setting to take effect."),
+			default: 4096,
+			minimum: 1,
 			tags: ['experimental', 'advanced'],
 			included: product.quality !== 'stable',
 		},

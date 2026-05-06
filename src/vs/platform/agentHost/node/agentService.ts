@@ -18,7 +18,11 @@ import { FileSystemProviderErrorCode, IFileService, toFileSystemProviderErrorCod
 import { InstantiationService } from '../../instantiation/common/instantiationService.js';
 import { ServiceCollection } from '../../instantiation/common/serviceCollection.js';
 import { ILogService } from '../../log/common/log.js';
-import { AgentProvider, AgentSession, IAgent, IAgentCreateSessionConfig, IAgentMaterializeSessionEvent, IAgentResolveSessionConfigParams, IAgentService, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult } from '../common/agentService.js';
+import { AgentProvider, AgentSession, IAgent, IAgentCreateSessionConfig, IAgentDispatchOptions, IAgentMaterializeSessionEvent, IAgentResolveSessionConfigParams, IAgentService, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult } from '../common/agentService.js';
+import { AgentHostOTelAttr } from '../common/otel/agentHostOTelAttributes.js';
+import { AgentHostOTelTracer, AgentHostVerboseTrace } from '../common/otel/agentHostOTelTracing.js';
+import { AgentHostSpanStatusCode, IAgentHostOTelService, type AgentHostCompletedSpan, type IAgentHostSpanHandle } from '../common/otel/agentHostOTelService.js';
+import { NoopAgentHostOTelService } from '../common/otel/noopAgentHostOTelService.js';
 import { ISessionDataService } from '../common/sessionDataService.js';
 import { ActionType, ActionEnvelope, INotification, type IRootConfigChangedAction, type SessionAction, type TerminalAction } from '../common/state/sessionActions.js';
 import type { CompletionsParams, CompletionsResult, CreateTerminalParams, ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../common/state/protocol/commands.js';
@@ -96,6 +100,7 @@ export class AgentService extends Disposable implements IAgentService {
 	 * for it.
 	 */
 	private readonly _resourceSubscribers = new ResourceMap<Set<string>>();
+	private readonly _otelTracer: AgentHostOTelTracer;
 
 	/**
 	 * Pending {@link _runSessionGc} timers, keyed by session URI. A timer is
@@ -115,8 +120,10 @@ export class AgentService extends Disposable implements IAgentService {
 		private readonly _productService: IProductService,
 		private readonly _gitService: IAgentHostGitService,
 		private readonly _rootConfigResource?: URI,
+		private readonly _agentHostOTelService: IAgentHostOTelService = NoopAgentHostOTelService.INSTANCE,
 	) {
 		super();
+		this._otelTracer = new AgentHostOTelTracer(this._agentHostOTelService);
 		this._logService.info('AgentService initialized');
 		this._stateManager = this._register(new AgentHostStateManager(_logService));
 		this._register(this._stateManager.onDidEmitEnvelope(e => this._onDidAction.fire(e)));
@@ -132,6 +139,7 @@ export class AgentService extends Disposable implements IAgentService {
 			[IProductService, this._productService],
 			[IAgentConfigurationService, configurationService],
 			[IAgentHostGitService, this._gitService],
+			[IAgentHostOTelService, this._agentHostOTelService],
 		);
 		const instantiationService = this._register(new InstantiationService(services, /*strict*/ true));
 
@@ -211,172 +219,235 @@ export class AgentService extends Disposable implements IAgentService {
 	// ---- session management -------------------------------------------------
 
 	async listSessions(): Promise<IAgentSessionMetadata[]> {
-		this._logService.trace('[AgentService] listSessions called');
-		const results = await Promise.all(
-			[...this._providers.values()].map(p => p.listSessions())
-		);
-		const flat = results.flat();
+		return this._otelTracer.traceVerbose(AgentHostVerboseTrace.ListSessions, async span => {
+			this._logService.trace('[AgentService] listSessions called');
+			const results = await this._otelTracer.traceVerbose(AgentHostVerboseTrace.ListSessionProviders, async providerSpan => {
+				const providerContext = providerSpan?.getSpanContext();
+				return Promise.all(
+					[...this._providers.values()].map(p => providerContext
+						? this._agentHostOTelService.runWithTraceContext(providerContext, () => p.listSessions())
+						: p.listSessions()
+					)
+				);
+			}, {
+				[AgentHostOTelAttr.SESSION_COUNT]: this._providers.size,
+			}, span);
+			const flat = results.flat();
+			span?.setAttribute(AgentHostOTelAttr.SESSION_COUNT, flat.length);
 
-		// Overlay persisted custom titles from per-session databases.
-		const result = await Promise.all(flat.map(async s => {
-			try {
-				const ref = await this._sessionDataService.tryOpenDatabase(s.session);
-				if (!ref) {
+			const overlayStats = { dbHits: 0, failures: 0 };
+			const result = await this._otelTracer.traceVerbose(AgentHostVerboseTrace.SessionMetadataOverlay, async overlaySpan => {
+				const sessions = await Promise.all(flat.map(async s => {
+					try {
+						return await this._readSessionMetadataOverlay(s, overlayStats);
+					} catch (e) {
+						overlayStats.failures++;
+						this._logService.warn(`[AgentService] Failed to read session metadata overlay for ${s.session}`, e);
+					}
 					return s;
-				}
-				try {
-					const m = await ref.object.getMetadataObject({ customTitle: true, isRead: true, isArchived: true, isDone: true, diffs: true });
-					let updated = s;
-					if (m.customTitle) {
-						updated = { ...updated, summary: m.customTitle };
-					}
-					if (m.isRead !== undefined) {
-						updated = { ...updated, isRead: m.isRead === 'true' };
-					}
-					if (m.isArchived !== undefined) {
-						updated = { ...updated, isArchived: m.isArchived === 'true' };
-					} else if (m.isDone !== undefined) {
-						updated = { ...updated, isArchived: m.isDone === 'true' };
-					}
-					if (m.diffs) {
-						try { updated = { ...updated, diffs: JSON.parse(m.diffs) }; } catch { /* ignore malformed */ }
-					}
-					return updated;
-				} finally {
-					ref.dispose();
-				}
-			} catch (e) {
-				this._logService.warn(`[AgentService] Failed to read session metadata overlay for ${s.session}`, e);
-			}
-			return s;
-		}));
+				}));
+				overlaySpan?.setAttributes({
+					[AgentHostOTelAttr.DB_HIT_COUNT]: overlayStats.dbHits,
+					[AgentHostOTelAttr.FAILURE_COUNT]: overlayStats.failures,
+				});
+				overlaySpan?.setStatus(overlayStats.failures === 0 ? AgentHostSpanStatusCode.OK : AgentHostSpanStatusCode.ERROR);
+				return sessions;
+			}, {
+				[AgentHostOTelAttr.SESSION_COUNT]: flat.length,
+				[AgentHostOTelAttr.DB_KEY_COUNT]: flat.length * 5,
+			}, span);
 
-		// Overlay live session state from the state manager.
-		// For the title, prefer the state manager's value when it is
-		// non-empty, so SDK-sourced titles are not overwritten by the
-		// initial empty placeholder.
-		const withStatus = result.map(s => {
-			const liveState = this._stateManager.getSessionState(s.session.toString());
-			if (liveState) {
-				return {
-					...s,
-					summary: liveState.summary.title || s.summary,
-					status: liveState.summary.status,
-					activity: liveState.summary.activity,
-					model: liveState.summary.model ?? s.model,
-				};
-			}
-			return s;
+			// Overlay live session state from the state manager.
+			// For the title, prefer the state manager's value when it is
+			// non-empty, so SDK-sourced titles are not overwritten by the
+			// initial empty placeholder.
+			const withStatus = result.map(s => {
+				const liveState = this._stateManager.getSessionState(s.session.toString());
+				if (liveState) {
+					return {
+						...s,
+						summary: liveState.summary.title || s.summary,
+						status: liveState.summary.status,
+						activity: liveState.summary.activity,
+						model: liveState.summary.model ?? s.model,
+					};
+				}
+				return s;
+			});
+
+			this._logService.trace(`[AgentService] listSessions returned ${withStatus.length} sessions`);
+			return withStatus;
+		}, {
+			[AgentHostOTelAttr.PROVIDER]: this._defaultProvider ?? '',
 		});
-
-		this._logService.trace(`[AgentService] listSessions returned ${withStatus.length} sessions`);
-		return withStatus;
 	}
 
-	async createSession(config?: IAgentCreateSessionConfig): Promise<URI> {
+	private async _readSessionMetadataOverlay(session: IAgentSessionMetadata, stats: { dbHits: number }): Promise<IAgentSessionMetadata> {
+		const ref = await this._sessionDataService.tryOpenDatabase(session.session);
+		if (!ref) {
+			return session;
+		}
+		stats.dbHits++;
+		try {
+			const m = await ref.object.getMetadataObject({ customTitle: true, isRead: true, isArchived: true, isDone: true, diffs: true });
+			let updated = session;
+			if (m.customTitle) {
+				updated = { ...updated, summary: m.customTitle };
+			}
+			if (m.isRead !== undefined) {
+				updated = { ...updated, isRead: m.isRead === 'true' };
+			}
+			if (m.isArchived !== undefined) {
+				updated = { ...updated, isArchived: m.isArchived === 'true' };
+			} else if (m.isDone !== undefined) {
+				updated = { ...updated, isArchived: m.isDone === 'true' };
+			}
+			if (m.diffs) {
+				try { updated = { ...updated, diffs: JSON.parse(m.diffs) }; } catch { /* ignore malformed */ }
+			}
+			return updated;
+		} finally {
+			ref.dispose();
+		}
+	}
+
+	async createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI> {
+		if (options?.traceContext) {
+			return this._agentHostOTelService.runWithTraceContext(options.traceContext, () => this._createSession(config));
+		}
+		return this._createSession(config);
+	}
+
+	private async _createSession(config?: IAgentCreateSessionConfig): Promise<URI> {
 		const providerId = config?.provider ?? this._defaultProvider;
 		const provider = providerId ? this._providers.get(providerId) : undefined;
 		if (!provider) {
 			throw new Error(`No agent provider registered for: ${providerId ?? '(none)'}`);
 		}
+		const span = this._otelTracer.startVerbose(AgentHostVerboseTrace.CreateSession, {
+			[AgentHostOTelAttr.PROVIDER]: provider.id,
+			[AgentHostOTelAttr.FORK]: config?.fork !== undefined,
+			[AgentHostOTelAttr.ACTIVE_CLIENT]: config?.activeClient !== undefined,
+			[AgentHostOTelAttr.HAS_MODEL]: config?.model !== undefined,
+			[AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: config?.workingDirectory !== undefined,
+		});
 
-		// When forking, build the old→new turn ID mapping before creating the
-		// session so the agent can use it to remap per-turn data. If the
-		// source has no turns to copy (e.g. a still-provisional session), a
-		// "fork" is indistinguishable from a fresh session, so we drop the
-		// fork parameter and fall through to the regular create path.
-		if (config?.fork) {
-			const sourceState = this._stateManager.getSessionState(config.fork.session.toString());
-			const sourceTurns = sourceState?.turns.slice(0, config.fork.turnIndex + 1) ?? [];
-			if (sourceTurns.length === 0) {
-				config = { ...config, fork: undefined };
-			} else {
-				const turnIdMapping = new Map<string, string>();
-				for (const t of sourceTurns) {
-					turnIdMapping.set(t.id, generateUuid());
+		try {
+			// When forking, build the old→new turn ID mapping before creating the
+			// session so the agent can use it to remap per-turn data. If the
+			// source has no turns to copy (e.g. a still-provisional session), a
+			// "fork" is indistinguishable from a fresh session, so we drop the
+			// fork parameter and fall through to the regular create path.
+			if (config?.fork) {
+				span?.addEvent('fork.prepare');
+				const sourceState = this._stateManager.getSessionState(config.fork.session.toString());
+				const sourceTurns = sourceState?.turns.slice(0, config.fork.turnIndex + 1) ?? [];
+				if (sourceTurns.length === 0) {
+					config = { ...config, fork: undefined };
+				} else {
+					const turnIdMapping = new Map<string, string>();
+					for (const t of sourceTurns) {
+						turnIdMapping.set(t.id, generateUuid());
+					}
+					config = {
+						...config,
+						fork: { ...config.fork, turnIdMapping },
+					};
 				}
-				config = {
-					...config,
-					fork: { ...config.fork, turnIdMapping },
-				};
-			}
-		}
-
-		// Ensure the command auto-approver is ready before any session events
-		// can arrive. This makes shell command auto-approval fully synchronous.
-		// Safe to run in parallel with createSession since no events flow until
-		// sendMessage() is called.
-		this._logService.trace(`[AgentService] createSession: initializing auto-approver and creating session...`);
-		const [, created] = await Promise.all([
-			this._sideEffects.initialize(),
-			provider.createSession(config),
-		]);
-		const session = created.session;
-		this._logService.trace(`[AgentService] createSession: initialization complete`);
-
-		// Cancel any pending GC armed for this URI. A client may be
-		// re-issuing `createSession` for an existing URI mid-grace (e.g.
-		// during a reconnect that returned `missing`); without this, the
-		// timer would still fire and dispose the just-revived session
-		// before the follow-up `subscribe` arrives.
-		this._cancelPendingSessionGc(session);
-
-		this._logService.trace(`[AgentService] createSession: provider=${provider.id} model=${config?.model?.id ?? '(default)'}`);
-		this._sessionToProvider.set(session.toString(), provider.id);
-		this._logService.trace(`[AgentService] createSession returned: ${session.toString()}`);
-
-		const sessionConfig = await this._resolveCreatedSessionConfig(provider, config);
-
-		// When forking, populate the new session's protocol state with
-		// the source session's turns so the client sees the forked history.
-		if (config?.fork) {
-			const sourceState = this._stateManager.getSessionState(config.fork.session.toString());
-			let sourceTurns: Turn[] = [];
-			if (sourceState && config.fork.turnIdMapping) {
-				sourceTurns = sourceState.turns.slice(0, config.fork.turnIndex + 1)
-					.map(t => ({ ...t, id: config!.fork!.turnIdMapping!.get(t.id) ?? generateUuid() }));
 			}
 
-			const summary = this._buildInitialSummary(provider, session, config, created, sourceState?.summary.title ?? 'Forked Session');
-			const state = this._stateManager.createSession(summary);
-			state.config = sessionConfig;
-			state.turns = sourceTurns;
-			state.activeClient = config.activeClient;
-		} else {
-			// Provisional sessions defer the `sessionAdded` notification and
-			// the `SessionReady` lifecycle transition until the agent fires
-			// {@link IAgent.onDidMaterializeSession} (typically on first
-			// `sendMessage`). Until then, the state exists in memory so
-			// clients can subscribe and stream config / model changes that
-			// the agent will pick up at materialization time.
-			const summary = this._buildInitialSummary(provider, session, config, created, '');
-			const state = this._stateManager.createSession(summary, { emitNotification: !created.provisional });
-			state.config = sessionConfig;
-			state.activeClient = config?.activeClient;
-		}
-		// Persist initial config values so a subsequent `restoreSession` can
-		// re-hydrate them. We persist the full resolved values (not just the
-		// user's input) so clients can render them on restore without having
-		// to re-resolve. Mid-session changes are persisted by `AgentSideEffects`
-		// when handling `SessionConfigChanged`.
-		if (sessionConfig?.values && Object.keys(sessionConfig.values).length > 0 && !created.provisional) {
-			this._persistConfigValues(session, sessionConfig.values);
-		}
+			// Ensure the command auto-approver is ready before any session events
+			// can arrive. This makes shell command auto-approval fully synchronous.
+			// Safe to run in parallel with createSession since no events flow until
+			// sendMessage() is called.
+			this._logService.trace(`[AgentService] createSession: initializing auto-approver and creating session...`);
+			span?.addEvent('provider.create_session.start');
+			const [, created] = await Promise.all([
+				this._sideEffects.initialize(),
+				provider.createSession(config),
+			]);
+			span?.addEvent('provider.create_session.end');
+			span?.setAttribute(AgentHostOTelAttr.PROVISIONAL, created.provisional === true);
+			const session = created.session;
+			this._logService.trace(`[AgentService] createSession: initialization complete`);
 
-		if (!created.provisional) {
-			// `SessionReady` transitions the session lifecycle from
-			// `Creating` to `Ready`. For provisional sessions we defer
-			// this to {@link _onDidMaterializeSession} so subscribers
-			// don't see `Ready` until the agent actually has an SDK
-			// session, working directory, etc.
-			this._stateManager.dispatchServerAction({ type: ActionType.SessionReady, session: session.toString() });
+			// Cancel any pending GC armed for this URI. A client may be
+			// re-issuing `createSession` for an existing URI mid-grace (e.g.
+			// during a reconnect that returned `missing`); without this, the
+			// timer would still fire and dispose the just-revived session
+			// before the follow-up `subscribe` arrives.
+			this._cancelPendingSessionGc(session);
 
-			// Lazily compute git state for sessions with a working directory;
-			// attaches under `state._meta.git` once ready.
-			this._attachGitState(session, created.workingDirectory ?? config?.workingDirectory);
+			this._logService.trace(`[AgentService] createSession: provider=${provider.id} model=${config?.model?.id ?? '(default)'}`);
+			this._sessionToProvider.set(session.toString(), provider.id);
+			this._logService.trace(`[AgentService] createSession returned: ${session.toString()}`);
+			span?.setAttribute(AgentHostOTelAttr.SESSION_ID, AgentSession.id(session));
+
+			span?.addEvent('session_config.resolve.start');
+			const sessionConfig = await this._resolveCreatedSessionConfig(provider, config, span);
+			span?.addEvent('session_config.resolve.end', { [AgentHostOTelAttr.HAS_SESSION_CONFIG]: sessionConfig !== undefined });
+
+			// When forking, populate the new session's protocol state with
+			// the source session's turns so the client sees the forked history.
+			if (config?.fork) {
+				const sourceState = this._stateManager.getSessionState(config.fork.session.toString());
+				let sourceTurns: Turn[] = [];
+				if (sourceState && config.fork.turnIdMapping) {
+					sourceTurns = sourceState.turns.slice(0, config.fork.turnIndex + 1)
+						.map(t => ({ ...t, id: config!.fork!.turnIdMapping!.get(t.id) ?? generateUuid() }));
+				}
+
+				const summary = this._buildInitialSummary(provider, session, config, created, sourceState?.summary.title ?? 'Forked Session');
+				const state = this._stateManager.createSession(summary);
+				state.config = sessionConfig;
+				state.turns = sourceTurns;
+				state.activeClient = config.activeClient;
+				span?.addEvent('state.create_session', { [AgentHostOTelAttr.FORK]: true, [AgentHostOTelAttr.TURN_COUNT]: sourceTurns.length });
+			} else {
+				// Provisional sessions defer the `sessionAdded` notification and
+				// the `SessionReady` lifecycle transition until the agent fires
+				// {@link IAgent.onDidMaterializeSession} (typically on first
+				// `sendMessage`). Until then, the state exists in memory so
+				// clients can subscribe and stream config / model changes that
+				// the agent will pick up at materialization time.
+				const summary = this._buildInitialSummary(provider, session, config, created, '');
+				const state = this._stateManager.createSession(summary, { emitNotification: !created.provisional });
+				state.config = sessionConfig;
+				state.activeClient = config?.activeClient;
+				span?.addEvent('state.create_session', { [AgentHostOTelAttr.PROVISIONAL]: created.provisional === true });
+			}
+			// Persist initial config values so a subsequent `restoreSession` can
+			// re-hydrate them. We persist the full resolved values (not just the
+			// user's input) so clients can render them on restore without having
+			// to re-resolve. Mid-session changes are persisted by `AgentSideEffects`
+			// when handling `SessionConfigChanged`.
+			if (sessionConfig?.values && Object.keys(sessionConfig.values).length > 0 && !created.provisional) {
+				span?.addEvent('session_config.persist');
+				this._persistConfigValues(session, sessionConfig.values, span);
+			}
+
+			if (!created.provisional) {
+				// `SessionReady` transitions the session lifecycle from
+				// `Creating` to `Ready`. For provisional sessions we defer
+				// this to {@link _onDidMaterializeSession} so subscribers
+				// don't see `Ready` until the agent actually has an SDK
+				// session, working directory, etc.
+				this._stateManager.dispatchServerAction({ type: ActionType.SessionReady, session: session.toString() });
+
+				// Lazily compute git state for sessions with a working directory;
+				// attaches under `state._meta.git` once ready.
+				this._attachGitState(session, created.workingDirectory ?? config?.workingDirectory);
+				span?.addEvent('session.ready');
+			}
+
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+			return session;
+		} catch (error) {
+			span?.recordException(error);
+			throw error;
+		} finally {
+			span?.end();
 		}
-
-		return session;
 	}
 
 	/**
@@ -467,35 +538,61 @@ export class AgentService extends Disposable implements IAgentService {
 		);
 	}
 
-	private _persistConfigValues(session: URI, values: Record<string, unknown>): void {
+	private _persistConfigValues(session: URI, values: Record<string, unknown>, parentSpan?: IAgentHostSpanHandle): void {
+		const span = this._otelTracer.startVerbose(AgentHostVerboseTrace.PersistConfigValues, {
+			[AgentHostOTelAttr.SESSION_ID]: AgentSession.id(session),
+			[AgentHostOTelAttr.DB_KEY_COUNT]: Object.keys(values).length,
+		}, parentSpan);
 		let ref;
 		try {
 			ref = this._sessionDataService.openDatabase(session);
 		} catch (err) {
 			this._logService.warn(`[AgentService] Failed to open session database to persist configValues for ${session.toString()}: ${toErrorMessage(err)}`);
+			span?.recordException(err);
+			span?.end();
 			return;
 		}
+		let failed = false;
 		ref.object.setMetadata('configValues', JSON.stringify(values)).catch(err => {
+			failed = true;
 			this._logService.warn(`[AgentService] Failed to persist configValues for ${session.toString()}: ${toErrorMessage(err)}`);
+			span?.recordException(err);
 		}).finally(() => {
+			if (!failed) {
+				span?.setStatus(AgentHostSpanStatusCode.OK);
+			}
+			span?.end();
 			ref.dispose();
 		});
 	}
 
-	private async _resolveCreatedSessionConfig(provider: IAgent, config: IAgentCreateSessionConfig | undefined): Promise<SessionConfigState | undefined> {
-		if (!config?.config && !config?.workingDirectory) {
-			return undefined;
-		}
+	private async _resolveCreatedSessionConfig(provider: IAgent, config: IAgentCreateSessionConfig | undefined, parentSpan?: IAgentHostSpanHandle): Promise<SessionConfigState | undefined> {
+		const span = this._otelTracer.startVerbose(AgentHostVerboseTrace.ResolveCreatedSessionConfig, {
+			[AgentHostOTelAttr.PROVIDER]: provider.id,
+			[AgentHostOTelAttr.HAS_INITIAL_CONFIG]: config?.config !== undefined,
+			[AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: config?.workingDirectory !== undefined,
+		}, parentSpan);
 		try {
-			const resolved = await provider.resolveSessionConfig({
-				provider: provider.id,
-				workingDirectory: config.workingDirectory,
-				config: config.config,
-			});
-			return { schema: resolved.schema, values: resolved.values };
-		} catch (error) {
-			this._logService.error(`[AgentService] Failed to resolve created session config for provider ${provider.id}`, error);
-			return config.config ? { schema: { type: 'object', properties: {} }, values: config.config } : undefined;
+			if (!config?.config && !config?.workingDirectory) {
+				span?.setStatus(AgentHostSpanStatusCode.OK);
+				return undefined;
+			}
+			try {
+				const resolved = await provider.resolveSessionConfig({
+					provider: provider.id,
+					workingDirectory: config.workingDirectory,
+					config: config.config,
+				});
+				span?.setAttribute(AgentHostOTelAttr.DB_KEY_COUNT, Object.keys(resolved.values ?? {}).length);
+				span?.setStatus(AgentHostSpanStatusCode.OK);
+				return { schema: resolved.schema, values: resolved.values };
+			} catch (error) {
+				this._logService.error(`[AgentService] Failed to resolve created session config for provider ${provider.id}`, error);
+				span?.recordException(error);
+				return config.config ? { schema: { type: 'object', properties: {} }, values: config.config } : undefined;
+			}
+		} finally {
+			span?.end();
 		}
 	}
 
@@ -749,15 +846,26 @@ export class AgentService extends Disposable implements IAgentService {
 		return false;
 	}
 
-	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number): void {
+	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number, options?: IAgentDispatchOptions): void {
 		this._logService.trace(`[AgentService] dispatchAction: type=${action.type}, clientId=${clientId}, clientSeq=${clientSeq}`, action);
 
-		const origin = { clientId, clientSeq };
-		this._stateManager.dispatchClientAction(action, origin);
-		if (action.type === ActionType.RootConfigChanged) {
-			this._configurationService.persistRootConfig();
+		const dispatch = () => {
+			const origin = { clientId, clientSeq };
+			this._stateManager.dispatchClientAction(action, origin);
+			if (action.type === ActionType.RootConfigChanged) {
+				this._configurationService.persistRootConfig();
+			}
+			this._sideEffects.handleAction(action);
+		};
+		if (options?.traceContext) {
+			this._agentHostOTelService.runWithTraceContext(options.traceContext, dispatch);
+		} else {
+			dispatch();
 		}
-		this._sideEffects.handleAction(action);
+	}
+
+	emitOTelSpan(span: AgentHostCompletedSpan): void {
+		this._agentHostOTelService.injectCompletedSpan(span);
 	}
 
 	async resourceList(uri: URI): Promise<ResourceListResult> {

@@ -54,6 +54,8 @@ import { AgentPluginManager } from './agentPluginManager.js';
 import { AgentHostGitService, IAgentHostGitService } from './agentHostGitService.js';
 import { registerPendingEditContentProvider } from './copilot/pendingEditContentStore.js';
 import { join } from '../../../base/common/path.js';
+import { IAgentHostOTelService } from '../common/otel/agentHostOTelService.js';
+import { AgentHostOTelService, createAgentHostOTelService } from './otel/agentHostOTelService.js';
 
 // Entry point for the agent host utility process.
 // Sets up IPC, logging, and registers agent providers (Copilot).
@@ -107,6 +109,11 @@ function startAgentHost(): void {
 		diServices.set(IFileService, fileService);
 		diServices.set(ISessionDataService, sessionDataService);
 		diServices.set(IProductService, productService);
+		const agentHostOTelService = createAgentHostOTelService(logService);
+		if (agentHostOTelService instanceof AgentHostOTelService) {
+			disposables.add(agentHostOTelService);
+		}
+		diServices.set(IAgentHostOTelService, agentHostOTelService);
 		const instantiationService = new InstantiationService(diServices);
 		const gitService = instantiationService.createInstance(AgentHostGitService);
 		diServices.set(IAgentHostGitService, gitService);
@@ -114,7 +121,7 @@ function startAgentHost(): void {
 		diServices.set(ICopilotApiService, copilotApiService);
 		const claudeProxyService = disposables.add(instantiationService.createInstance(ClaudeProxyService));
 		diServices.set(IClaudeProxyService, claudeProxyService);
-		agentService = new AgentService(logService, fileService, sessionDataService, productService, gitService, rootConfigResource);
+		agentService = new AgentService(logService, fileService, sessionDataService, productService, gitService, rootConfigResource, agentHostOTelService);
 		const pluginManager = new AgentPluginManager(URI.file(environmentService.userDataPath), fileService, logService);
 		diServices.set(IAgentPluginManager, pluginManager);
 		const diffComputeService = disposables.add(new NodeWorkerDiffComputeService(logService));

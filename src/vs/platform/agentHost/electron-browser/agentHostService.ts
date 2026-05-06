@@ -14,7 +14,7 @@ import { acquirePort } from '../../../base/parts/ipc/electron-browser/ipc.mp.js'
 import { InstantiationType, registerSingleton } from '../../instantiation/common/extensions.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
 import { ILogService } from '../../log/common/log.js';
-import { AgentHostEnabledSettingId, AgentHostIpcChannels, IAgentCreateSessionConfig, IAgentHostInspectInfo, IAgentHostService, IAgentResolveSessionConfigParams, IAgentService, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IAgentHostSocketInfo, IConnectionTrackerService } from '../common/agentService.js';
+import { AgentHostEnabledSettingId, AgentHostIpcChannels, IAgentCreateSessionConfig, IAgentDispatchOptions, IAgentHostInspectInfo, IAgentHostService, IAgentResolveSessionConfigParams, IAgentService, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, IAgentHostSocketInfo, IConnectionTrackerService } from '../common/agentService.js';
 import { AgentSubscriptionManager, type IAgentSubscription } from '../common/state/agentSubscription.js';
 import type { CompletionsParams, CompletionsResult, CreateTerminalParams, ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../common/state/protocol/commands.js';
 import type { ActionEnvelope, INotification, IRootConfigChangedAction, SessionAction, TerminalAction } from '../common/state/sessionActions.js';
@@ -24,6 +24,8 @@ import { revive } from '../../../base/common/marshalling.js';
 import { URI } from '../../../base/common/uri.js';
 import { IFileService } from '../../files/common/files.js';
 import { AGENT_HOST_CLIENT_RESOURCE_CHANNEL, AgentHostClientResourceChannel } from '../common/agentHostClientResourceChannel.js';
+import { IAgentHostOTelService } from '../common/otel/agentHostOTelService.js';
+import { BrowserAgentHostOTelService } from '../browser/agentHostOTelService.js';
 
 /**
  * Renderer-side implementation of {@link IAgentHostService} that connects
@@ -143,8 +145,8 @@ class AgentHostServiceClient extends Disposable implements IAgentHostService {
 	listSessions(): Promise<IAgentSessionMetadata[]> {
 		return this._proxy.listSessions();
 	}
-	createSession(config?: IAgentCreateSessionConfig): Promise<URI> {
-		return this._proxy.createSession(config);
+	createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI> {
+		return this._proxy.createSession(config, options);
 	}
 	resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
 		return this._proxy.resolveSessionConfig(params);
@@ -173,8 +175,11 @@ class AgentHostServiceClient extends Disposable implements IAgentHostService {
 	private unsubscribe(resource: URI): void {
 		this._proxy.unsubscribe(resource, this.clientId);
 	}
-	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number): void {
-		this._proxy.dispatchAction(action, clientId, clientSeq);
+	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number, options?: IAgentDispatchOptions): void {
+		this._proxy.dispatchAction(action, clientId, clientSeq, options);
+	}
+	emitOTelSpan(span: Parameters<IAgentService['emitOTelSpan']>[0]): void {
+		this._proxy.emitOTelSpan(span);
 	}
 	private _nextSeq = 1;
 	nextClientSeq(): number {
@@ -193,9 +198,9 @@ class AgentHostServiceClient extends Disposable implements IAgentHostService {
 		return this._subscriptionManager.getSubscriptionUnmanaged<T>(resource);
 	}
 
-	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction): void {
+	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction, options?: IAgentDispatchOptions): void {
 		const seq = this._subscriptionManager.dispatchOptimistic(action);
-		this.dispatchAction(action, this.clientId, seq);
+		this.dispatchAction(action, this.clientId, seq, options);
 	}
 
 	resourceList(uri: URI): Promise<ResourceListResult> {
@@ -230,3 +235,4 @@ class AgentHostServiceClient extends Disposable implements IAgentHostService {
 }
 
 registerSingleton(IAgentHostService, AgentHostServiceClient, InstantiationType.Delayed);
+registerSingleton(IAgentHostOTelService, BrowserAgentHostOTelService, InstantiationType.Delayed);

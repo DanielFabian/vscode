@@ -19,7 +19,8 @@ import { getResolvedShellEnv } from '../../shell/node/shellEnv.js';
 import { NullTelemetryService } from '../../telemetry/common/telemetryUtils.js';
 import { UtilityProcess } from '../../utilityProcess/electron-main/utilityProcess.js';
 import { IAgentHostConnection, IAgentHostStarter } from '../common/agent.js';
-import { AgentHostClaudeAgentEnabledSettingId, AgentHostEnableClaudeEnvVar } from '../common/agentService.js';
+import { AgentHostClaudeAgentEnabledSettingId, AgentHostEnableClaudeEnvVar, AgentHostOTelCaptureContentSettingId, AgentHostOTelEnabledSettingId, AgentHostOTelEndpointSettingId, AgentHostOTelMaxAttributeSizeSettingId, AgentHostOTelVerboseTracingSettingId } from '../common/agentService.js';
+import { AgentHostOTelEnvVar } from '../node/otel/agentHostOTelConfig.js';
 import { deepClone } from '../../../base/common/objects.js';
 
 export class ElectronAgentHostStarter extends Disposable implements IAgentHostStarter {
@@ -69,6 +70,14 @@ export class ElectronAgentHostStarter extends Disposable implements IAgentHostSt
 		// or the env var is already set on the parent process (developer override).
 		const claudeEnabled = this._configurationService.getValue<boolean>(AgentHostClaudeAgentEnabledSettingId)
 			|| process.env[AgentHostEnableClaudeEnvVar] === '1';
+		const otelEnabled = this._configurationService.getValue<boolean>(AgentHostOTelEnabledSettingId)
+			|| process.env[AgentHostOTelEnvVar.Enabled] === '1';
+		const otelVerboseTracing = this._configurationService.getValue<boolean>(AgentHostOTelVerboseTracingSettingId)
+			|| process.env[AgentHostOTelEnvVar.VerboseTracing] === '1';
+		const otelCaptureContent = this._configurationService.getValue<boolean>(AgentHostOTelCaptureContentSettingId)
+			|| process.env[AgentHostOTelEnvVar.CaptureContent] === '1';
+		const otelEndpoint = this._configurationService.getValue<string>(AgentHostOTelEndpointSettingId) || process.env[AgentHostOTelEnvVar.OtlpEndpoint];
+		const otelMaxAttributeSizeChars = this._configurationService.getValue<number>(AgentHostOTelMaxAttributeSizeSettingId);
 
 		this.utilityProcess.start({
 			type: 'agentHost',
@@ -86,6 +95,11 @@ export class ElectronAgentHostStarter extends Disposable implements IAgentHostSt
 				VSCODE_PIPE_LOGGING: 'true',
 				VSCODE_VERBOSE_LOGGING: 'true',
 				...(claudeEnabled ? { [AgentHostEnableClaudeEnvVar]: '1' } : {}),
+				...(otelEnabled ? { [AgentHostOTelEnvVar.Enabled]: '1' } : {}),
+				...(otelVerboseTracing ? { [AgentHostOTelEnvVar.VerboseTracing]: '1' } : {}),
+				...(otelCaptureContent ? { [AgentHostOTelEnvVar.CaptureContent]: '1' } : {}),
+				...(otelEndpoint ? { [AgentHostOTelEnvVar.OtlpEndpoint]: otelEndpoint } : {}),
+				...(typeof otelMaxAttributeSizeChars === 'number' ? { [AgentHostOTelEnvVar.MaxAttributeSizeChars]: String(otelMaxAttributeSizeChars) } : {}),
 			}
 		});
 

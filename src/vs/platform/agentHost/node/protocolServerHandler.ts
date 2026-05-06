@@ -11,6 +11,7 @@ import { URI } from '../../../base/common/uri.js';
 import { ILogService } from '../../log/common/log.js';
 import { AHPFileSystemProvider } from '../common/agentHostFileSystemProvider.js';
 import { AgentSession, type IAgentService } from '../common/agentService.js';
+import { parseTraceParent } from '../common/otel/agentHostTraceContext.js';
 import type { CommandMap } from '../common/state/protocol/messages.js';
 import type { UnsupportedProtocolVersionErrorData } from '../common/state/protocol/errors.js';
 import { ActionEnvelope, ActionType, INotification, isSessionAction, isTerminalAction, type SessionAction, type TerminalAction, type IRootConfigChangedAction } from '../common/state/sessionActions.js';
@@ -196,7 +197,9 @@ export class ProtocolServerHandler extends Disposable {
 							this._logService.trace(`[ProtocolServer] dispatchAction: ${JSON.stringify(msg.params.action.type)}`);
 							const action = msg.params.action as SessionAction | TerminalAction | IRootConfigChangedAction;
 							if (isSessionAction(action) || isTerminalAction(action) || action.type === ActionType.RootConfigChanged) {
-								this._agentService.dispatchAction(action, client.clientId, msg.params.clientSeq);
+								const params = msg.params as typeof msg.params & { traceparent?: string; tracestate?: string };
+								const traceContext = params.traceparent ? parseTraceParent(params.traceparent, params.tracestate) : undefined;
+								this._agentService.dispatchAction(action, client.clientId, msg.params.clientSeq, traceContext ? { traceContext } : undefined);
 							}
 						}
 						break;
@@ -489,6 +492,8 @@ export class ProtocolServerHandler extends Disposable {
 		},
 		createSession: async (_client, params) => {
 			let createdSession: URI;
+			const traceParams = params as typeof params & { traceparent?: string; tracestate?: string };
+			const traceContext = traceParams.traceparent ? parseTraceParent(traceParams.traceparent, traceParams.tracestate) : undefined;
 			// Resolve fork turnId to a 0-based index using the source session's
 			// turn list in the state manager.
 			let fork: { session: URI; turnIndex: number; turnId: string } | undefined;
@@ -517,7 +522,7 @@ export class ProtocolServerHandler extends Disposable {
 					fork,
 					config: params.config,
 					activeClient: params.activeClient,
-				});
+				}, traceContext ? { traceContext } : undefined);
 			} catch (err) {
 				if (err instanceof ProtocolError) {
 					throw err;

@@ -26,6 +26,10 @@ import { AgentHostConfigKey, agentHostCustomizationConfigSchema } from '../../co
 import { AutoApproveLevel, ISchemaProperty, SessionMode, createSchema, platformSessionSchema, schemaProperty } from '../../common/agentHostSchema.js';
 import { IAgentPluginManager, ISyncedCustomization } from '../../common/agentPluginManager.js';
 import { AgentSession, AgentSignal, GITHUB_COPILOT_PROTECTED_RESOURCE, IAgent, IAgentAttachment, IAgentCreateSessionConfig, IAgentCreateSessionResult, IAgentDescriptor, IAgentMaterializeSessionEvent, IAgentModelInfo, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, IAgentSessionProjectInfo } from '../../common/agentService.js';
+import { AgentHostOTelAttr } from '../../common/otel/agentHostOTelAttributes.js';
+import { AgentHostOTelTracer, AgentHostSdkTrace, AgentHostVerboseTrace } from '../../common/otel/agentHostOTelTracing.js';
+import { formatTraceParent, type AgentHostTraceContext } from '../../common/otel/agentHostTraceContext.js';
+import { AgentHostSpanStatusCode, IAgentHostOTelService, type IAgentHostSpanHandle } from '../../common/otel/agentHostOTelService.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { ISessionDataService, SESSION_DB_FILENAME } from '../../common/sessionDataService.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
@@ -155,6 +159,22 @@ function buildWorktreeAnnouncementText(branchName: string): string {
 	) + '\n\n';
 }
 
+function toCopilotSdkOtlpEndpoint(endpoint: string | undefined): string | undefined {
+	if (!endpoint) {
+		return undefined;
+	}
+	try {
+		const url = new URL(endpoint);
+		if (url.pathname === '/v1/traces') {
+			url.pathname = '/';
+			return url.toString();
+		}
+		return endpoint;
+	} catch {
+		return endpoint;
+	}
+}
+
 /**
  * Returns a copy of `turns` where `announcement` has been prepended to the
  * first top-level assistant turn's first markdown response part. Used on
@@ -229,6 +249,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 	private readonly _sessionSequencer = new SequencerByKey<string>();
 	private _shutdownPromise: Promise<void> | undefined;
 	private readonly _plugins: PluginController;
+	private readonly _otelTracer: AgentHostOTelTracer;
 	readonly onDidCustomizationsChange: Event<void>;
 	/** Per-session active client state for tools + plugin snapshot tracking. */
 	private readonly _activeClients = new ResourceMap<ActiveClient>();
@@ -241,8 +262,10 @@ export class CopilotAgent extends Disposable implements IAgent {
 		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
 		@IAgentHostTerminalManager private readonly _terminalManager: IAgentHostTerminalManager,
 		@IAgentConfigurationService private readonly _configurationService: IAgentConfigurationService,
+		@IAgentHostOTelService private readonly _agentHostOTelService: IAgentHostOTelService,
 	) {
 		super();
+		this._otelTracer = new AgentHostOTelTracer(this._agentHostOTelService, { provider: this.id });
 		this._plugins = this._register(this._instantiationService.createInstance(PluginController));
 		this.onDidCustomizationsChange = this._plugins.onDidChange;
 	}
@@ -433,10 +456,18 @@ export class CopilotAgent extends Disposable implements IAgent {
 				autoStart: true,
 				env,
 				cliPath,
+				telemetry: this._getCopilotSdkTelemetryConfig(),
+				onGetTraceContext: () => {
+					const traceContext = this._agentHostOTelService.getActiveTraceContext() ?? this._getActiveSessionTraceContext();
+					return traceContext ? { traceparent: formatTraceParent(traceContext), tracestate: traceContext.traceState } : {};
+				},
 			});
-			await client.start();
+			if (this._agentHostOTelService.config.enabled) {
+				this._logService.info(`[Copilot] SDK OTel enabled: endpoint=${toCopilotSdkOtlpEndpoint(this._agentHostOTelService.config.otlpEndpoint) ?? '<default>'}, captureContent=${this._agentHostOTelService.config.captureContent}`);
+			}
+			await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientStart, () => client.start());
 			if (this._githubToken !== tokenAtStartup) {
-				await client.stop();
+				await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientStopAuthenticationChanged, () => client.stop());
 				throw new Error('Copilot authentication changed while the client was starting');
 			}
 			this._logService.info('[Copilot] CopilotClient started successfully');
@@ -450,6 +481,33 @@ export class CopilotAgent extends Disposable implements IAgent {
 			this._clientStarting = undefined;
 		});
 		return clientStarting;
+	}
+
+	private _getActiveSessionTraceContext(): AgentHostTraceContext | undefined {
+		let result: AgentHostTraceContext | undefined;
+		for (const session of this._sessions.values()) {
+			const traceContext = session.getActiveTraceContext();
+			if (traceContext) {
+				if (result) {
+					return undefined;
+				}
+				result = traceContext;
+			}
+		}
+		return result;
+	}
+
+	private _getCopilotSdkTelemetryConfig(): CopilotClientOptions['telemetry'] {
+		const config = this._agentHostOTelService.config;
+		if (!config.enabled) {
+			return undefined;
+		}
+		return {
+			otlpEndpoint: toCopilotSdkOtlpEndpoint(config.otlpEndpoint),
+			exporterType: 'otlp-http',
+			sourceName: 'vscode-agent-host-copilot-sdk',
+			captureContent: config.captureContent,
+		};
 	}
 
 	// ---- session management -------------------------------------------------
@@ -523,93 +581,109 @@ export class CopilotAgent extends Disposable implements IAgent {
 	}
 
 	async listSessions(): Promise<IAgentSessionMetadata[]> {
-		this._logService.info('[Copilot] Listing sessions...');
-		const client = await this._ensureClient();
-		const sessions = await client.listSessions();
-		const projectLimiter = new Limiter<IAgentSessionProjectInfo | undefined>(4);
-		const projectByContext = new Map<string, Promise<IAgentSessionProjectInfo | undefined>>();
-		const mapped = await Promise.all(sessions.map(async s => {
-			const session = AgentSession.uri(this.id, s.sessionId);
-			const metadata = await this._readStoredSessionMetadata(session);
-			if (!metadata) {
-				return undefined;
-			}
-			let { project, resolved } = metadata;
-			if (!resolved) {
-				project = await this._resolveSessionProject(s.context, projectLimiter, projectByContext);
-				void this._storeSessionProjectResolution(session, project);
-			}
-			const workingDirectory = metadata.workingDirectory ?? (typeof s.context?.cwd === 'string' ? URI.file(s.context.cwd) : undefined);
-			const result: IAgentSessionMetadata = {
-				session,
-				startTime: s.startTime.getTime(),
-				modifiedTime: s.modifiedTime.getTime(),
-				project,
-				summary: s.summary,
-				model: metadata.model,
-				workingDirectory,
-				customizationDirectory: metadata.customizationDirectory,
-			};
+		return this._otelTracer.traceVerbose(AgentHostVerboseTrace.CopilotListSessions, async span => {
+			this._logService.info('[Copilot] Listing sessions...');
+			const client = await this._ensureClient();
+			const sessions = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientListSessions, () => client.listSessions(), {}, span);
+			span?.setAttribute(AgentHostOTelAttr.SESSION_COUNT, sessions.length);
+			const projectLimiter = new Limiter<IAgentSessionProjectInfo | undefined>(4);
+			const projectByContext = new Map<string, Promise<IAgentSessionProjectInfo | undefined>>();
+			const mapped = await this._otelTracer.traceVerbose(AgentHostVerboseTrace.ReadStoredSessionMetadataBatch, async () => {
+				return Promise.all(sessions.map(async s => {
+					const session = AgentSession.uri(this.id, s.sessionId);
+					const metadata = await this._readStoredSessionMetadata(session, undefined, false);
+					if (!metadata) {
+						return undefined;
+					}
+					let { project, resolved } = metadata;
+					if (!resolved) {
+						project = await this._resolveSessionProject(s.context, projectLimiter, projectByContext);
+						void this._storeSessionProjectResolution(session, project);
+					}
+					const workingDirectory = metadata.workingDirectory ?? (typeof s.context?.cwd === 'string' ? URI.file(s.context.cwd) : undefined);
+					const result: IAgentSessionMetadata = {
+						session,
+						startTime: s.startTime.getTime(),
+						modifiedTime: s.modifiedTime.getTime(),
+						project,
+						summary: s.summary,
+						model: metadata.model,
+						workingDirectory,
+						customizationDirectory: metadata.customizationDirectory,
+					};
+					return result;
+				}));
+			}, {
+				[AgentHostOTelAttr.SESSION_COUNT]: sessions.length,
+				[AgentHostOTelAttr.DB_KEY_COUNT]: sessions.length * 6,
+			}, span);
+			const result = mapped.filter((s): s is IAgentSessionMetadata => s !== undefined);
+			this._logService.info(`[Copilot] Found ${result.length} sessions`);
 			return result;
-		}));
-		const result = mapped.filter((s): s is IAgentSessionMetadata => s !== undefined);
-		this._logService.info(`[Copilot] Found ${result.length} sessions`);
-		return result;
+		});
 	}
 
 	async getSessionMetadata(session: URI): Promise<IAgentSessionMetadata | undefined> {
 		const sessionId = AgentSession.id(session);
-		const storedMetadata = await this._readStoredSessionMetadata(session);
-		if (!storedMetadata) {
-			return undefined;
-		}
+		return this._otelTracer.traceVerbose(AgentHostVerboseTrace.CopilotGetSessionMetadata, async span => {
+			const storedMetadata = await this._readStoredSessionMetadata(session);
+			if (!storedMetadata) {
+				return undefined;
+			}
 
-		const client = await this._ensureClient();
-		const sessionMetadata = await client.getSessionMetadata(sessionId);
-		if (!sessionMetadata) {
-			return undefined;
-		}
+			const client = await this._ensureClient();
+			const sessionMetadata = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientGetSessionMetadata, () => client.getSessionMetadata(sessionId), {
+				[AgentHostOTelAttr.SESSION_ID]: sessionId,
+			}, span);
+			if (!sessionMetadata) {
+				return undefined;
+			}
 
-		let project = storedMetadata?.project;
-		if (storedMetadata && !storedMetadata.resolved) {
-			const projectLimiter = new Limiter<IAgentSessionProjectInfo | undefined>(1);
-			project = await this._resolveSessionProject(sessionMetadata?.context, projectLimiter, new Map<string, Promise<IAgentSessionProjectInfo | undefined>>());
-			void this._storeSessionProjectResolution(session, project);
-		}
+			let project = storedMetadata?.project;
+			if (storedMetadata && !storedMetadata.resolved) {
+				const projectLimiter = new Limiter<IAgentSessionProjectInfo | undefined>(1);
+				project = await this._resolveSessionProject(sessionMetadata?.context, projectLimiter, new Map<string, Promise<IAgentSessionProjectInfo | undefined>>());
+				void this._storeSessionProjectResolution(session, project);
+			}
 
-		const workingDirectory = storedMetadata?.workingDirectory ?? (typeof sessionMetadata?.context?.cwd === 'string' ? URI.file(sessionMetadata.context.cwd) : undefined);
-		return {
-			session,
-			startTime: sessionMetadata?.startTime.getTime() ?? Date.now(),
-			modifiedTime: sessionMetadata?.modifiedTime.getTime() ?? Date.now(),
-			project,
-			summary: sessionMetadata?.summary,
-			model: storedMetadata?.model,
-			workingDirectory,
-			customizationDirectory: storedMetadata?.customizationDirectory,
-		};
+			const workingDirectory = storedMetadata?.workingDirectory ?? (typeof sessionMetadata?.context?.cwd === 'string' ? URI.file(sessionMetadata.context.cwd) : undefined);
+			return {
+				session,
+				startTime: sessionMetadata?.startTime.getTime() ?? Date.now(),
+				modifiedTime: sessionMetadata?.modifiedTime.getTime() ?? Date.now(),
+				project,
+				summary: sessionMetadata?.summary,
+				model: storedMetadata?.model,
+				workingDirectory,
+				customizationDirectory: storedMetadata?.customizationDirectory,
+			};
+		}, {
+			[AgentHostOTelAttr.SESSION_ID]: sessionId,
+		});
 	}
 
 	private async _listModels(): Promise<IAgentModelInfo[]> {
-		this._logService.info('[Copilot] Listing models...');
-		const client = await this._ensureClient();
-		const models = await client.listModels();
-		const result = models.map((m): IAgentModelInfo => ({
-			provider: this.id,
-			id: m.id,
-			name: m.name,
-			// Synthetic SDK entries like `auto` ship with `capabilities: {}` and
-			// no fixed context window — surface them with maxContextWindow undefined.
-			maxContextWindow: m.capabilities?.limits?.max_context_window_tokens,
-			supportsVision: !!m.capabilities?.supports?.vision,
-			configSchema: this._createThinkingLevelConfigSchema(m.supportedReasoningEfforts, m.defaultReasoningEffort),
-			policyState: m.policy?.state as PolicyState | undefined,
-			_meta: typeof m.billing?.multiplier === 'number' ? {
-				multiplierNumeric: m.billing.multiplier,
-			} : undefined,
-		}));
-		this._logService.info(`[Copilot] Found ${result.length} models`);
-		return result;
+		return this._otelTracer.traceVerbose(AgentHostVerboseTrace.CopilotListModels, async span => {
+			this._logService.info('[Copilot] Listing models...');
+			const client = await this._ensureClient();
+			const models = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientListModels, () => client.listModels(), {}, span);
+			const result = models.map((m): IAgentModelInfo => ({
+				provider: this.id,
+				id: m.id,
+				name: m.name,
+				// Synthetic SDK entries like `auto` ship with `capabilities: {}` and
+				// no fixed context window — surface them with maxContextWindow undefined.
+				maxContextWindow: m.capabilities?.limits?.max_context_window_tokens,
+				supportsVision: !!m.capabilities?.supports?.vision,
+				configSchema: this._createThinkingLevelConfigSchema(m.supportedReasoningEfforts, m.defaultReasoningEffort),
+				policyState: m.policy?.state as PolicyState | undefined,
+				_meta: typeof m.billing?.multiplier === 'number' ? {
+					multiplierNumeric: m.billing.multiplier,
+				} : undefined,
+			}));
+			this._logService.info(`[Copilot] Found ${result.length} models`);
+			return result;
+		});
 	}
 
 	async createSession(config?: IAgentCreateSessionConfig): Promise<IAgentCreateSessionResult> {
@@ -639,9 +713,12 @@ export class CopilotAgent extends Disposable implements IAgent {
 				// If there's no next turn, omit toEventId to include all events.
 				const toEventId = await sourceEntry.getNextTurnEventId(config.fork!.turnId);
 
-				const forkResult = await client.rpc.sessions.fork({
+				const forkResult = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientForkSession, () => client.rpc.sessions.fork({
 					sessionId: sourceSessionId,
 					...(toEventId ? { toEventId } : {}),
+				}), {
+					[AgentHostOTelAttr.SESSION_ID]: sourceSessionId,
+					[AgentHostOTelAttr.FORK]: true,
 				});
 				const newSessionId = forkResult.sessionId;
 
@@ -766,54 +843,90 @@ export class CopilotAgent extends Disposable implements IAgent {
 		if (!provisional) {
 			throw new Error(`Cannot materialize unknown provisional session: ${sessionId}`);
 		}
-		const client = await this._ensureClient();
-		const sessionUri = provisional.sessionUri;
-		const liveSessionConfig = this._configurationService.getSessionConfigValues(sessionUri.toString());
-
-		const materializedConfig: IAgentCreateSessionConfig = {
-			provider: this.id,
-			session: sessionUri,
-			workingDirectory: provisional.workingDirectory,
-			model: provisional.model,
-			config: liveSessionConfig,
-		};
-
-		const customizationDirectory = provisional.workingDirectory;
-		const activeClient = this._activeClients.get(sessionUri);
-		const snapshot = activeClient ? await activeClient.snapshot(customizationDirectory) : undefined;
-		const workingDirectory = await this._resolveSessionWorkingDirectory(materializedConfig, sessionId);
-		const shellManager = this._instantiationService.createInstance(ShellManager, sessionUri, workingDirectory);
-		const sessionConfigBuilder = this._buildSessionConfig(snapshot, shellManager);
-
-		const factory: SessionWrapperFactory = async callbacks => {
-			const raw = await client.createSession({
-				model: provisional.model?.id,
-				reasoningEffort: this._getReasoningEffort(provisional.model),
-				sessionId,
-				streaming: true,
-				workingDirectory: workingDirectory?.fsPath,
-				...await sessionConfigBuilder(callbacks),
-			});
-			return new CopilotSessionWrapper(raw);
-		};
-
-		let agentSession: CopilotAgentSession;
+		const span = this._otelTracer.startVerbose(AgentHostVerboseTrace.MaterializeProvisional, {
+			[AgentHostOTelAttr.SESSION_ID]: sessionId,
+			[AgentHostOTelAttr.PROVISIONAL]: true,
+			[AgentHostOTelAttr.HAS_MODEL]: provisional.model !== undefined,
+		});
 		try {
-			agentSession = this._createAgentSession(factory, sessionId, shellManager, workingDirectory, customizationDirectory, snapshot);
-			await agentSession.initializeSession();
+			span?.addEvent('client.ensure.start');
+			const client = await this._ensureClient();
+			span?.addEvent('client.ensure.end');
+			const sessionUri = provisional.sessionUri;
+			const liveSessionConfig = this._configurationService.getSessionConfigValues(sessionUri.toString());
+
+			const materializedConfig: IAgentCreateSessionConfig = {
+				provider: this.id,
+				session: sessionUri,
+				workingDirectory: provisional.workingDirectory,
+				model: provisional.model,
+				config: liveSessionConfig,
+			};
+
+			const customizationDirectory = provisional.workingDirectory;
+			const activeClient = this._activeClients.get(sessionUri);
+			span?.setAttribute(AgentHostOTelAttr.ACTIVE_CLIENT, activeClient !== undefined);
+			span?.addEvent('active_client.snapshot.start');
+			const snapshot = activeClient ? await activeClient.snapshot(customizationDirectory) : undefined;
+			span?.addEvent('active_client.snapshot.end', { [AgentHostOTelAttr.HAS_SNAPSHOT]: snapshot !== undefined });
+			span?.addEvent('working_directory.resolve.start');
+			const workingDirectory = await this._resolveSessionWorkingDirectory(materializedConfig, sessionId);
+			span?.addEvent('working_directory.resolve.end', { [AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: workingDirectory !== undefined });
+			const shellManager = this._instantiationService.createInstance(ShellManager, sessionUri, workingDirectory);
+			const sessionConfigBuilder = this._buildSessionConfig(snapshot, shellManager);
+
+			const factory: SessionWrapperFactory = async callbacks => {
+				const raw = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientCreateSessionForMaterialization, async () => client.createSession({
+					model: provisional.model?.id,
+					reasoningEffort: this._getReasoningEffort(provisional.model),
+					sessionId,
+					streaming: true,
+					workingDirectory: workingDirectory?.fsPath,
+					...await sessionConfigBuilder(callbacks),
+				}), {
+					[AgentHostOTelAttr.SESSION_ID]: sessionId,
+					[AgentHostOTelAttr.HAS_MODEL]: provisional.model !== undefined,
+					[AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: workingDirectory !== undefined,
+				}, span);
+				return new CopilotSessionWrapper(raw);
+			};
+
+			let agentSession: CopilotAgentSession;
+			try {
+				span?.addEvent('sdk.session.create.start');
+				agentSession = this._createAgentSession(factory, sessionId, shellManager, workingDirectory, customizationDirectory, snapshot);
+				await agentSession.initializeSession();
+				span?.addEvent('sdk.session.create.end');
+			} catch (error) {
+				await this._removeCreatedWorktree(sessionId);
+				throw error;
+			}
+
+			span?.addEvent('project.resolve.start');
+			const project = await projectFromCopilotContext({ cwd: workingDirectory?.fsPath }, this._gitService);
+			span?.addEvent('project.resolve.end', { [AgentHostOTelAttr.HAS_PROJECT]: project !== undefined });
+
+			this._provisionalSessions.delete(sessionId);
+			span?.addEvent('session_metadata.store.start');
+			await this._storeSessionMetadata(sessionUri, provisional.model, workingDirectory, customizationDirectory, project, true, span);
+			span?.addEvent('session_metadata.store.end');
+
+			this._logService.info(`[Copilot] Session materialized: ${sessionUri.toString()}`);
+			const traceContext = span?.getSpanContext();
+			const fireMaterialized = () => this._onDidMaterializeSession.fire({ session: sessionUri, workingDirectory, project });
+			if (traceContext) {
+				this._agentHostOTelService.runWithTraceContext(traceContext, fireMaterialized);
+			} else {
+				fireMaterialized();
+			}
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+			return agentSession;
 		} catch (error) {
-			await this._removeCreatedWorktree(sessionId);
+			span?.recordException(error);
 			throw error;
+		} finally {
+			span?.end();
 		}
-
-		const project = await projectFromCopilotContext({ cwd: workingDirectory?.fsPath }, this._gitService);
-
-		this._provisionalSessions.delete(sessionId);
-		await this._storeSessionMetadata(sessionUri, provisional.model, workingDirectory, customizationDirectory, project, true);
-
-		this._logService.info(`[Copilot] Session materialized: ${sessionUri.toString()}`);
-		this._onDidMaterializeSession.fire({ session: sessionUri, workingDirectory, project });
-		return agentSession;
 	}
 
 	async resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
@@ -1333,7 +1446,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 		const plugins = snapshot?.plugins ?? [];
 
 		return async (callbacks: Parameters<SessionWrapperFactory>[0]) => {
-			const shellTools = await createShellTools(shellManager, this._terminalManager, this._logService);
+			const shellTools = await createShellTools(shellManager, this._terminalManager, this._logService, this._agentHostOTelService);
 			const customAgents = await toSdkCustomAgents(plugins.flatMap(p => p.agents), this._fileService);
 			return {
 				onPermissionRequest: callbacks.onPermissionRequest,
@@ -1362,7 +1475,9 @@ export class CopilotAgent extends Disposable implements IAgent {
 		const customizationDirectory = storedMetadata.customizationDirectory ?? storedMetadata.workingDirectory;
 		const activeClient = this._activeClients.get(sessionUri);
 		const snapshot = activeClient ? await activeClient.snapshot(customizationDirectory) : undefined;
-		const sessionMetadata = await client.getSessionMetadata(sessionId).catch(err => {
+		const sessionMetadata = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientGetSessionMetadataForResume, () => client.getSessionMetadata(sessionId), {
+			[AgentHostOTelAttr.SESSION_ID]: sessionId,
+		}).catch(err => {
 			this._logService.warn(`[Copilot:${sessionId}] getSessionMetadata failed`, err);
 			return undefined;
 		});
@@ -1378,9 +1493,12 @@ export class CopilotAgent extends Disposable implements IAgent {
 			const config = await sessionConfig(callbacks);
 			try {
 				this._logService.info(`[Copilot:${sessionId}] Calling SDK resumeSession...`);
-				const raw = await client.resumeSession(sessionId, {
+				const raw = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientResumeSession, () => client.resumeSession(sessionId, {
 					...config,
 					workingDirectory: workingDirectory?.fsPath,
+				}), {
+					[AgentHostOTelAttr.SESSION_ID]: sessionId,
+					[AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: workingDirectory !== undefined,
 				});
 				this._logService.info(`[Copilot:${sessionId}] SDK resumeSession succeeded`);
 				return new CopilotSessionWrapper(raw);
@@ -1396,13 +1514,17 @@ export class CopilotAgent extends Disposable implements IAgent {
 				}
 
 				this._logService.warn(`[Copilot:${sessionId}] Resume failed (code=-32603), falling back to createSession with same ID`);
-				const raw = await client.createSession({
+				const raw = await this._otelTracer.traceSdkCall(AgentHostSdkTrace.ClientCreateSessionForResumeFallback, () => client.createSession({
 					...config,
 					sessionId,
 					streaming: true,
 					model: storedMetadata.model?.id,
 					reasoningEffort: this._getReasoningEffort(storedMetadata.model),
 					workingDirectory: workingDirectory?.fsPath,
+				}), {
+					[AgentHostOTelAttr.SESSION_ID]: sessionId,
+					[AgentHostOTelAttr.HAS_MODEL]: storedMetadata.model !== undefined,
+					[AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: workingDirectory !== undefined,
 				});
 				this._logService.info(`[Copilot:${sessionId}] Fallback createSession succeeded`);
 
@@ -1529,7 +1651,13 @@ export class CopilotAgent extends Disposable implements IAgent {
 		}
 	}
 
-	private async _storeSessionMetadata(session: URI, model: ModelSelection | undefined, workingDirectory: URI | undefined, customizationDirectory: URI | undefined, project: IAgentSessionProjectInfo | undefined, projectResolved = project !== undefined): Promise<void> {
+	private async _storeSessionMetadata(session: URI, model: ModelSelection | undefined, workingDirectory: URI | undefined, customizationDirectory: URI | undefined, project: IAgentSessionProjectInfo | undefined, projectResolved = project !== undefined, parentSpan?: IAgentHostSpanHandle): Promise<void> {
+		const span = this._otelTracer.startVerbose(AgentHostVerboseTrace.StoreSessionMetadata, {
+			[AgentHostOTelAttr.SESSION_ID]: AgentSession.id(session),
+			[AgentHostOTelAttr.HAS_MODEL]: model !== undefined,
+			[AgentHostOTelAttr.HAS_WORKING_DIRECTORY]: workingDirectory !== undefined,
+			[AgentHostOTelAttr.HAS_PROJECT]: project !== undefined,
+		}, parentSpan);
 		const dbRef = this._sessionDataService.openDatabase(session);
 		const db = dbRef.object;
 		try {
@@ -1550,15 +1678,28 @@ export class CopilotAgent extends Disposable implements IAgent {
 				work.push(db.setMetadata(CopilotAgent._META_PROJECT_URI, project.uri.toString()));
 				work.push(db.setMetadata(CopilotAgent._META_PROJECT_DISPLAY_NAME, project.displayName));
 			}
+			span?.setAttribute(AgentHostOTelAttr.DB_KEY_COUNT, work.length);
 			await Promise.all(work);
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+		} catch (error) {
+			span?.recordException(error);
+			throw error;
 		} finally {
 			dbRef.dispose();
+			span?.end();
 		}
 	}
 
 	private async _readSessionMetadata(session: URI): Promise<{ model?: ModelSelection; workingDirectory?: URI; customizationDirectory?: URI }> {
+		const span = this._otelTracer.startVerbose(AgentHostVerboseTrace.ReadSessionMetadata, {
+			[AgentHostOTelAttr.SESSION_ID]: AgentSession.id(session),
+			[AgentHostOTelAttr.DB_KEY_COUNT]: 3,
+		});
 		const ref = await this._sessionDataService.tryOpenDatabase(session);
+		span?.setAttribute(AgentHostOTelAttr.DB_HIT, ref !== undefined);
 		if (!ref) {
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+			span?.end();
 			return {};
 		}
 		try {
@@ -1567,19 +1708,32 @@ export class CopilotAgent extends Disposable implements IAgent {
 				ref.object.getMetadata(CopilotAgent._META_CWD),
 				ref.object.getMetadata(CopilotAgent._META_CUSTOMIZATION_DIRECTORY),
 			]);
-			return {
+			const result = {
 				model: this._parseModelSelection(model),
 				workingDirectory: cwd ? URI.parse(cwd) : undefined,
 				customizationDirectory: customizationDirectory ? URI.parse(customizationDirectory) : undefined,
 			};
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+			return result;
+		} catch (error) {
+			span?.recordException(error);
+			throw error;
 		} finally {
 			ref.dispose();
+			span?.end();
 		}
 	}
 
-	private async _readStoredSessionMetadata(session: URI): Promise<{ model?: ModelSelection; workingDirectory?: URI; customizationDirectory?: URI; project?: IAgentSessionProjectInfo; resolved: boolean } | undefined> {
+	private async _readStoredSessionMetadata(session: URI, parentSpan?: IAgentHostSpanHandle, emitSpan = true): Promise<{ model?: ModelSelection; workingDirectory?: URI; customizationDirectory?: URI; project?: IAgentSessionProjectInfo; resolved: boolean } | undefined> {
+		const span = emitSpan ? this._otelTracer.startVerbose(AgentHostVerboseTrace.ReadStoredSessionMetadata, {
+			[AgentHostOTelAttr.SESSION_ID]: AgentSession.id(session),
+			[AgentHostOTelAttr.DB_KEY_COUNT]: 6,
+		}, parentSpan) : undefined;
 		const ref = await this._sessionDataService.tryOpenDatabase(session);
+		span?.setAttribute(AgentHostOTelAttr.DB_HIT, ref !== undefined);
 		if (!ref) {
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+			span?.end();
 			return undefined;
 		}
 		try {
@@ -1593,15 +1747,21 @@ export class CopilotAgent extends Disposable implements IAgent {
 			]);
 			const workingDirectory = cwd ? URI.parse(cwd) : undefined;
 			const project = uri && displayName ? { uri: URI.parse(uri), displayName } : undefined;
-			return {
+			const result = {
 				model: this._parseModelSelection(model),
 				workingDirectory,
 				customizationDirectory: customizationDirectory ? URI.parse(customizationDirectory) : undefined,
 				project,
 				resolved: resolved === 'true' || project !== undefined,
 			};
+			span?.setStatus(AgentHostSpanStatusCode.OK);
+			return result;
+		} catch (error) {
+			span?.recordException(error);
+			throw error;
 		} finally {
 			ref.dispose();
+			span?.end();
 		}
 	}
 

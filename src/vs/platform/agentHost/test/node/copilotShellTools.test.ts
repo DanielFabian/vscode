@@ -11,10 +11,13 @@ import { IInstantiationService } from '../../../instantiation/common/instantiati
 import { InstantiationService } from '../../../instantiation/common/instantiationService.js';
 import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
 import { ILogService, NullLogService } from '../../../log/common/log.js';
+import { AgentHostGenAiAttr } from '../../common/otel/agentHostOTelAttributes.js';
+import type { AgentHostCompletedSpan } from '../../common/otel/agentHostOTelService.js';
+import { InMemoryAgentHostOTelService } from '../../common/otel/inMemoryAgentHostOTelService.js';
 import type { CreateTerminalParams } from '../../common/state/protocol/commands.js';
 import type { TerminalClaim, TerminalInfo } from '../../common/state/protocol/state.js';
 import { IAgentHostTerminalManager } from '../../node/agentHostTerminalManager.js';
-import { ShellManager, prefixForHistorySuppression, shellTypeForExecutable } from '../../node/copilot/copilotShellTools.js';
+import { createShellTools, ShellManager, prefixForHistorySuppression, shellTypeForExecutable } from '../../node/copilot/copilotShellTools.js';
 
 class TestAgentHostTerminalManager implements IAgentHostTerminalManager {
 	declare readonly _serviceBrand: undefined;
@@ -150,5 +153,52 @@ suite('CopilotShellTools', () => {
 		assert.strictEqual(terminalManager.created.length, 2);
 		first.dispose();
 		second.dispose();
+	});
+
+	test('shell tool handler spans are parented to SDK tool trace context', async () => {
+		const terminalManager = new TestAgentHostTerminalManager();
+		const services = new ServiceCollection();
+		services.set(ILogService, new NullLogService());
+		services.set(IAgentHostTerminalManager, terminalManager);
+		const instantiationService: IInstantiationService = disposables.add(new InstantiationService(services));
+		services.set(IInstantiationService, instantiationService);
+		const shellManager = disposables.add(instantiationService.createInstance(ShellManager, URI.parse('copilot:/session-1'), undefined));
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: true,
+			captureContent: false,
+			maxAttributeSizeChars: 0,
+		}));
+		const completed = new Promise<AgentHostCompletedSpan>(resolve => {
+			disposables.add(otelService.onDidCompleteSpan(resolve));
+		});
+		const tools = await createShellTools(shellManager, terminalManager, new NullLogService(), otelService);
+		const readTool = tools.find(tool => tool.name === 'read_bash');
+		assert.ok(readTool);
+
+		await readTool.handler({}, {
+			sessionId: 'sdk-session-1',
+			toolCallId: 'tool-1',
+			toolName: 'read_bash',
+			arguments: {},
+			traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+		});
+		const span = await completed;
+
+		assert.deepStrictEqual({
+			name: span.name,
+			traceId: span.traceId,
+			parentSpanId: span.parentSpanId,
+			operation: span.attributes[AgentHostGenAiAttr.OPERATION_NAME],
+			toolName: span.attributes[AgentHostGenAiAttr.TOOL_NAME],
+			toolCallId: span.attributes[AgentHostGenAiAttr.TOOL_CALL_ID],
+		}, {
+			name: 'vscode_agent_host.tool_handler read_bash',
+			traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+			parentSpanId: '00f067aa0ba902b7',
+			operation: 'execute_tool',
+			toolName: 'read_bash',
+			toolCallId: 'tool-1',
+		});
 	});
 });

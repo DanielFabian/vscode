@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { CopilotClient, CopilotSession, ModelInfo, SessionEventPayload, SessionEventType, TypedSessionEventHandler } from '@github/copilot-sdk';
+import type { CopilotClient, CopilotClientOptions, CopilotSession, ModelInfo, SessionEventPayload, SessionEventType, TypedSessionEventHandler } from '@github/copilot-sdk';
 import assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
@@ -20,6 +20,9 @@ import { ServiceCollection } from '../../../instantiation/common/serviceCollecti
 import { ILogService, NullLogService } from '../../../log/common/log.js';
 import { IAgentPluginManager, ISyncedCustomization } from '../../common/agentPluginManager.js';
 import { AgentSession, type AgentSignal, type IAgentActionSignal, type IAgentSessionMetadata } from '../../common/agentService.js';
+import { InMemoryAgentHostOTelService } from '../../common/otel/inMemoryAgentHostOTelService.js';
+import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
+import { NoopAgentHostOTelService } from '../../common/otel/noopAgentHostOTelService.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
 import { AHP_AUTH_REQUIRED, ProtocolError } from '../../common/state/sessionProtocol.js';
 import { buildSubagentSessionUri, ResponsePartKind, SessionCustomization, TurnState, type CustomizationRef, type MarkdownResponsePart, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
@@ -216,6 +219,7 @@ class MockCopilotSession {
 class TestableCopilotAgent extends CopilotAgent {
 	private readonly _fakeSessions = new Map<string, IFakeAgentSession>();
 	readonly resumeCalls: string[] = [];
+	lastClientOptions: CopilotClientOptions | undefined;
 
 	constructor(
 		private readonly _copilotClient: ITestCopilotClient,
@@ -226,12 +230,14 @@ class TestableCopilotAgent extends CopilotAgent {
 		@IAgentHostGitService gitService: IAgentHostGitService,
 		@IAgentHostTerminalManager terminalManager: IAgentHostTerminalManager,
 		@IAgentConfigurationService configurationService: IAgentConfigurationService,
+		@IAgentHostOTelService agentHostOTelService: IAgentHostOTelService,
 	) {
-		super(logService, instantiationService, fileService, sessionDataService, gitService, terminalManager, configurationService);
+		super(logService, instantiationService, fileService, sessionDataService, gitService, terminalManager, configurationService, agentHostOTelService);
 		this._enablePlanModeOnClient(this._copilotClient as CopilotClient);
 	}
 
-	protected override _createCopilotClient(): CopilotClient {
+	protected override _createCopilotClient(options: CopilotClientOptions): CopilotClient {
+		this.lastClientOptions = options;
 		return this._copilotClient as CopilotClient;
 	}
 
@@ -278,7 +284,7 @@ class TestableCopilotAgent extends CopilotAgent {
 	}
 }
 
-function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager }): { agent: CopilotAgent; instantiationService: IInstantiationService } {
+function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager; otelService?: IAgentHostOTelService }): { agent: CopilotAgent; instantiationService: IInstantiationService } {
 	const services = new ServiceCollection();
 	const logService = new NullLogService();
 	const fileService = disposables.add(new FileService(logService));
@@ -291,6 +297,7 @@ function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, optio
 	services.set(IAgentPluginManager, options?.pluginManager ?? new TestAgentPluginManager());
 	services.set(IAgentHostGitService, options?.gitService ?? new TestAgentHostGitService());
 	services.set(IAgentHostTerminalManager, new TestAgentHostTerminalManager());
+	services.set(IAgentHostOTelService, options?.otelService ?? NoopAgentHostOTelService.INSTANCE);
 	if (options?.environmentServiceRegistration !== 'none') {
 		const environmentService = {
 			_serviceBrand: undefined,
@@ -306,17 +313,17 @@ function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, optio
 	return { agent, instantiationService };
 }
 
-function createTestAgent(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager }): CopilotAgent {
+function createTestAgent(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager; otelService?: IAgentHostOTelService }): CopilotAgent {
 	return createTestAgentContext(disposables, options).agent;
 }
 
-function createAgentSessionThroughAgent(agent: CopilotAgent, instantiationService: IInstantiationService): CopilotAgentSession {
-	const sessionUri = AgentSession.uri('copilotcli', 'test-session-1');
+function createAgentSessionThroughAgent(agent: CopilotAgent, instantiationService: IInstantiationService, sessionId = 'test-session-1'): CopilotAgentSession {
+	const sessionUri = AgentSession.uri('copilotcli', sessionId);
 	const shellManager = instantiationService.createInstance(ShellManager, sessionUri, undefined);
 	const wrapperFactory: SessionWrapperFactory = async () => new CopilotSessionWrapper(new MockCopilotSession() as unknown as CopilotSession);
 	return (agent as unknown as {
 		_createAgentSession: (wrapperFactory: SessionWrapperFactory, sessionId: string, shellManager: ShellManager) => CopilotAgentSession;
-	})._createAgentSession(wrapperFactory, 'test-session-1', shellManager);
+	})._createAgentSession(wrapperFactory, sessionId, shellManager);
 }
 
 function withoutUndefinedProperties(metadata: IAgentSessionMetadata): Record<string, unknown> {
@@ -397,6 +404,23 @@ suite('CopilotAgent', () => {
 		}
 	});
 
+	test('does not configure Copilot SDK telemetry when Agent Host OTel is disabled', async () => {
+		const agent = createTestAgent(disposables, { copilotClient: new TestCopilotClient([]) }) as TestableCopilotAgent;
+		try {
+			await agent.authenticate('https://api.github.com', 'token');
+
+			assert.deepStrictEqual({
+				telemetry: agent.lastClientOptions?.telemetry,
+				traceContext: await agent.lastClientOptions?.onGetTraceContext?.(),
+			}, {
+				telemetry: undefined,
+				traceContext: {},
+			});
+		} finally {
+			await disposeAgent(agent);
+		}
+	});
+
 	test('models include billing multiplier metadata when SDK provides it', async () => {
 		const agent = createTestAgent(disposables, {
 			copilotClient: new TestCopilotClient([], [{
@@ -422,6 +446,94 @@ suite('CopilotAgent', () => {
 			}]);
 		} finally {
 			await disposeAgent(agent);
+		}
+	});
+
+	test('configures Copilot SDK telemetry and propagates active trace context', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: false,
+			captureContent: true,
+			maxAttributeSizeChars: 100,
+			otlpEndpoint: 'http://localhost:4318/v1/traces',
+			serviceName: 'vscode-agent-host-test',
+		}));
+		const agent = createTestAgent(disposables, { copilotClient: new TestCopilotClient([]), otelService }) as TestableCopilotAgent;
+		try {
+			await agent.authenticate('https://api.github.com', 'token');
+
+			assert.deepStrictEqual(agent.lastClientOptions?.telemetry, {
+				otlpEndpoint: 'http://localhost:4318/',
+				exporterType: 'otlp-http',
+				sourceName: 'vscode-agent-host-copilot-sdk',
+				captureContent: true,
+			});
+			await otelService.startActiveSpan('parent', {}, async () => {
+				const activeContext = otelService.getActiveTraceContext();
+				assert.ok(activeContext);
+				assert.deepStrictEqual(await agent.lastClientOptions?.onGetTraceContext?.(), {
+					traceparent: `00-${activeContext.traceId}-${activeContext.spanId}-01`,
+					tracestate: undefined,
+				});
+			});
+		} finally {
+			await disposeAgent(agent);
+		}
+	});
+
+	test('Copilot SDK trace context falls back to active agent span after send returns', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: false,
+			captureContent: false,
+			maxAttributeSizeChars: 0,
+			otlpEndpoint: 'http://localhost:4318/v1/traces',
+			serviceName: 'vscode-agent-host-test',
+		}));
+		const { agent, instantiationService } = createTestAgentContext(disposables, { copilotClient: new TestCopilotClient([]), otelService, sessionDataService: disposables.add(new TestSessionDataService()) });
+		const testableAgent = agent as TestableCopilotAgent;
+		try {
+			await testableAgent.authenticate('https://api.github.com', 'token');
+			const agentSession = disposables.add(createAgentSessionThroughAgent(testableAgent, instantiationService));
+			await agentSession.initializeSession();
+			await agentSession.send('hello', undefined, 'turn-id');
+
+			const activeContext = agentSession.getActiveTraceContext();
+			assert.ok(activeContext);
+			assert.deepStrictEqual(await testableAgent.lastClientOptions?.onGetTraceContext?.(), {
+				traceparent: `00-${activeContext.traceId}-${activeContext.spanId}-01`,
+				tracestate: undefined,
+			});
+		} finally {
+			await disposeAgent(testableAgent);
+		}
+	});
+
+	test('Copilot SDK trace context fallback avoids ambiguous concurrent sessions', async () => {
+		const otelService = disposables.add(new InMemoryAgentHostOTelService({
+			enabled: true,
+			verboseTracing: false,
+			captureContent: false,
+			maxAttributeSizeChars: 0,
+			otlpEndpoint: 'http://localhost:4318/v1/traces',
+			serviceName: 'vscode-agent-host-test',
+		}));
+		const { agent, instantiationService } = createTestAgentContext(disposables, { copilotClient: new TestCopilotClient([]), otelService, sessionDataService: disposables.add(new TestSessionDataService()) });
+		const testableAgent = agent as TestableCopilotAgent;
+		try {
+			await testableAgent.authenticate('https://api.github.com', 'token');
+			const firstSession = disposables.add(createAgentSessionThroughAgent(testableAgent, instantiationService, 'test-session-1'));
+			const secondSession = disposables.add(createAgentSessionThroughAgent(testableAgent, instantiationService, 'test-session-2'));
+			await firstSession.initializeSession();
+			await secondSession.initializeSession();
+			await firstSession.send('hello', undefined, 'turn-1');
+			await secondSession.send('hello', undefined, 'turn-2');
+
+			assert.ok(firstSession.getActiveTraceContext());
+			assert.ok(secondSession.getActiveTraceContext());
+			assert.deepStrictEqual(await testableAgent.lastClientOptions?.onGetTraceContext?.(), {});
+		} finally {
+			await disposeAgent(testableAgent);
 		}
 	});
 

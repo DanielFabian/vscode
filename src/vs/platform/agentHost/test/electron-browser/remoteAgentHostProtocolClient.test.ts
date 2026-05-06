@@ -295,6 +295,75 @@ suite('RemoteAgentHostProtocolClient', () => {
 		await resultPromise;
 	});
 
+	test('serializes trace context on dispatchAction notifications', () => {
+		const { client, transport } = createClient();
+
+		client.dispatchAction({
+			type: ActionType.SessionTurnStarted,
+			session: 'copilot:///test-session',
+			turnId: 'turn-1',
+			userMessage: { text: 'hello' },
+		}, client.clientId, 7, {
+			traceContext: {
+				traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+				spanId: '00f067aa0ba902b7',
+				traceFlags: 1,
+				traceState: 'vendor=value',
+			},
+		});
+
+		assert.deepStrictEqual(transport.sentMessages[0], {
+			jsonrpc: '2.0',
+			method: 'dispatchAction',
+			params: {
+				clientSeq: 7,
+				traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+				tracestate: 'vendor=value',
+				action: {
+					type: ActionType.SessionTurnStarted,
+					session: 'copilot:///test-session',
+					turnId: 'turn-1',
+					userMessage: { text: 'hello' },
+				},
+			},
+		});
+	});
+
+	test('serializes trace context on createSession requests', async () => {
+		const { client, transport } = createClient();
+		const session = URI.parse('copilot:///test-session');
+		const result = client.createSession({
+			provider: 'copilot',
+			session,
+		}, {
+			traceContext: {
+				traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+				spanId: '00f067aa0ba902b7',
+				traceFlags: 1,
+				traceState: 'vendor=value',
+			},
+		});
+
+		assert.deepStrictEqual(transport.sentMessages[0], {
+			jsonrpc: '2.0',
+			id: 1,
+			method: 'createSession',
+			params: {
+				session: session.toString(),
+				provider: 'copilot',
+				model: undefined,
+				workingDirectory: undefined,
+				config: undefined,
+				activeClient: undefined,
+				traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+				tracestate: 'vendor=value',
+			},
+		});
+
+		transport.fireMessage({ jsonrpc: '2.0', id: 1, result: null });
+		assert.deepStrictEqual(await result, session);
+	});
+
 	test('rejects shutdown with structured JSON-RPC error', async () => {
 		const { client, transport } = createClient();
 		const resultPromise = client.shutdown();

@@ -17,7 +17,8 @@ import { URI } from '../../../base/common/uri.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogService } from '../../log/common/log.js';
 import { FileSystemProviderErrorCode, IFileService, toFileSystemProviderErrorCode } from '../../files/common/files.js';
-import { AgentSession, IAgentConnection, IAgentCreateSessionConfig, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult } from '../common/agentService.js';
+import { AgentSession, IAgentConnection, IAgentCreateSessionConfig, IAgentDispatchOptions, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult } from '../common/agentService.js';
+import { formatTraceParent } from '../common/otel/agentHostTraceContext.js';
 import { AgentSubscriptionManager, type IAgentSubscription } from '../common/state/agentSubscription.js';
 import { agentHostAuthority, fromAgentHostUri, toAgentHostUri } from '../common/agentHostUri.js';
 import { AgentHostPermissionMode, IAgentHostPermissionService } from '../common/agentHostPermissionService.js';
@@ -28,7 +29,7 @@ import { PROTOCOL_VERSION } from '../common/state/protocol/version/registry.js';
 import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, ProtocolError, type ProtocolMessage, type IStateSnapshot } from '../common/state/sessionProtocol.js';
 import { isClientTransport, type IProtocolTransport } from '../common/state/sessionTransport.js';
 import { AhpErrorCodes } from '../common/state/protocol/errors.js';
-import { ContentEncoding, ResourceRequestParams, type CompletionsParams, type CompletionsResult, type CreateTerminalParams, type ResolveSessionConfigResult, type SessionConfigCompletionsResult } from '../common/state/protocol/commands.js';
+import { ContentEncoding, ResourceRequestParams, type CompletionsParams, type CompletionsResult, type CreateSessionParams, type CreateTerminalParams, type DispatchActionParams, type ResolveSessionConfigResult, type SessionConfigCompletionsResult } from '../common/state/protocol/commands.js';
 import { decodeBase64, encodeBase64, VSBuffer } from '../../../base/common/buffer.js';
 
 const AHP_CLIENT_CONNECTION_CLOSED = -32000;
@@ -180,9 +181,9 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 		return this._subscriptionManager.getSubscriptionUnmanaged<T>(resource);
 	}
 
-	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction): void {
+	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction, options?: IAgentDispatchOptions): void {
 		const seq = this._subscriptionManager.dispatchOptimistic(action);
-		this.dispatchAction(action, this._clientId, seq);
+		this.dispatchAction(action, this._clientId, seq, options);
 	}
 
 	/**
@@ -203,15 +204,21 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 	/**
 	 * Dispatch a client action to the server. Returns the clientSeq used.
 	 */
-	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, _clientId: string, clientSeq: number): void {
+	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, _clientId: string, clientSeq: number, options?: IAgentDispatchOptions): void {
 		this._grantImplicitReadsForOutgoingAction(action);
-		this._sendNotification('dispatchAction', { clientSeq, action });
+		const params: DispatchActionParams & { traceparent?: string; tracestate?: string } = { clientSeq, action };
+		const traceparent = options?.traceContext ? formatTraceParent(options.traceContext) : undefined;
+		if (traceparent) {
+			params.traceparent = traceparent;
+			params.tracestate = options?.traceContext?.traceState;
+		}
+		this._sendNotification('dispatchAction', params);
 	}
 
 	/**
 	 * Create a new session on the remote agent host.
 	 */
-	async createSession(config?: IAgentCreateSessionConfig): Promise<URI> {
+	async createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI> {
 		const provider = config?.provider;
 		if (!provider) {
 			throw new Error('Cannot create remote agent host session without a provider.');
@@ -220,14 +227,20 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 		if (config?.activeClient?.customizations) {
 			this._grantImplicitReadsForCustomizations(config.activeClient.customizations);
 		}
-		await this._sendRequest('createSession', {
+		const traceparent = options?.traceContext ? formatTraceParent(options.traceContext) : undefined;
+		const params: CreateSessionParams & { traceparent?: string; tracestate?: string } = {
 			session: session.toString(),
 			provider,
 			model: config?.model,
 			workingDirectory: config?.workingDirectory ? fromAgentHostUri(config.workingDirectory).toString() : undefined,
 			config: config?.config,
 			activeClient: config?.activeClient,
-		});
+		};
+		if (traceparent) {
+			params.traceparent = traceparent;
+			params.tracestate = options?.traceContext?.traceState;
+		}
+		await this._sendRequest('createSession', params);
 		return session;
 	}
 

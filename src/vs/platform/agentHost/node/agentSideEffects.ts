@@ -32,6 +32,7 @@ import {
 } from '../common/state/sessionState.js';
 import { AgentHostStateManager } from './agentHostStateManager.js';
 import { IAgentHostGitService, META_DIFF_BASE_BRANCH } from './agentHostGitService.js';
+import { IAgentHostOTelService } from '../common/otel/agentHostOTelService.js';
 import { NodeWorkerDiffComputeService } from './diffComputeService.js';
 import { computeSessionDiffs, type IIncrementalDiffOptions } from './sessionDiffAggregator.js';
 import { SessionPermissionManager } from './sessionPermissions.js';
@@ -110,6 +111,7 @@ export class AgentSideEffects extends Disposable {
 		@IInstantiationService instantiationService: IInstantiationService,
 		@ILogService private readonly _logService: ILogService,
 		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
+		@IAgentHostOTelService private readonly _agentHostOTelService: IAgentHostOTelService,
 	) {
 		super();
 		this._diffComputeService = this._register(new NodeWorkerDiffComputeService(this._logService));
@@ -702,7 +704,10 @@ export class AgentSideEffects extends Disposable {
 					uri: URI.parse(a.uri),
 					displayName: a.displayName,
 				}));
-				agent.sendMessage(URI.parse(action.session), action.userMessage.text, attachments, action.turnId).catch(err => {
+				const sendMessage = () => agent.sendMessage(URI.parse(action.session), action.userMessage.text, attachments, action.turnId);
+				const traceContext = this._agentHostOTelService.getActiveTraceContext();
+				const sendMessagePromise = traceContext ? this._agentHostOTelService.runWithTraceContext(traceContext, sendMessage) : sendMessage();
+				sendMessagePromise.catch(err => {
 					const errCode = (err as { code?: number })?.code;
 					this._logService.error(`[AgentSideEffects] sendMessage failed for session=${action.session}: code=${errCode}, message=${err instanceof Error ? err.message : String(err)}, type=${err?.constructor?.name}`, err);
 					this._stateManager.dispatchServerAction({
@@ -937,7 +942,10 @@ export class AgentSideEffects extends Disposable {
 			uri: URI.parse(a.uri),
 			displayName: a.displayName,
 		}));
-		agent.sendMessage(URI.parse(session), msg.userMessage.text, attachments, turnId).catch(err => {
+		const sendMessage = () => agent.sendMessage(URI.parse(session), msg.userMessage.text, attachments, turnId);
+		const traceContext = this._agentHostOTelService.getActiveTraceContext();
+		const sendMessagePromise = traceContext ? this._agentHostOTelService.runWithTraceContext(traceContext, sendMessage) : sendMessage();
+		sendMessagePromise.catch(err => {
 			this._logService.error('[AgentSideEffects] sendMessage failed (queued)', err);
 			this._stateManager.dispatchServerAction({
 				type: ActionType.SessionError,

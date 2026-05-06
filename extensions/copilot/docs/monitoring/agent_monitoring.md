@@ -74,6 +74,18 @@ Open **Settings** (`Ctrl+,`) and search for `copilot otel`:
 | `github.copilot.chat.otel.outfile` | string | `""` | File path for JSON-lines output |
 | `github.copilot.chat.otel.dbSpanExporter.enabled` | boolean | `false` | Persist OTel spans to a local SQLite database for the **Chat: Export Agent Traces DB** command. Implicitly enables OTel. |
 
+### Agent Host Settings
+
+Agent Host sessions run outside the extension host and use separate `chat.agentHost.otel.*` settings. These settings are off by default and currently target development builds. Restart the agent host process after changing them. When enabled, the Agent Host exports provider spans and configures the spawned Copilot SDK/CLI process to export its native request-level `chat`, tool, hook, permission, and subagent spans to the same collector.
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `chat.agentHost.otel.enabled` | boolean | `false` | Enable Agent Host OTel trace export |
+| `chat.agentHost.otel.verboseTracing` | boolean | `false` | Include workbench-to-agent spans, Agent Host create/session/database spans, and propagate trace context to the provider |
+| `chat.agentHost.otel.captureContent` | boolean | `false` | Include prompt, tool argument, and tool result content in attributes |
+| `chat.agentHost.otel.otlpEndpoint` | string | `""` | OTLP/HTTP traces endpoint; defaults to `http://localhost:4318/v1/traces` when empty |
+| `chat.agentHost.otel.maxAttributeSizeChars` | number | `4096` | Maximum length for Agent Host string attributes |
+
 ### Environment Variables
 
 Environment variables **always take precedence** over VS Code settings.
@@ -93,6 +105,25 @@ Environment variables **always take precedence** over VS Code settings.
 | `COPILOT_OTEL_FILE_EXPORTER_PATH` | — | Write all signals to this file (JSON-lines) |
 | `COPILOT_OTEL_HTTP_INSTRUMENTATION` | `false` | Enable HTTP-level OTel instrumentation |
 | `OTEL_EXPORTER_OTLP_HEADERS` | — | Auth headers (e.g., `Authorization=Bearer token`) |
+
+Agent Host settings are forwarded to the local agent host process as:
+
+| Variable | Description |
+|---|---|
+| `VSCODE_AGENT_HOST_OTEL_ENABLED` | Enable Agent Host OTel export |
+| `VSCODE_AGENT_HOST_OTEL_VERBOSE_TRACING` | Enable frontend-to-agent verbose spans |
+| `VSCODE_AGENT_HOST_OTEL_CAPTURE_CONTENT` | Include content attributes |
+| `VSCODE_AGENT_HOST_OTEL_OTLP_ENDPOINT` | OTLP/HTTP traces endpoint |
+| `VSCODE_AGENT_HOST_OTEL_MAX_ATTRIBUTE_SIZE_CHARS` | Maximum string attribute length |
+| `VSCODE_AGENT_HOST_OTEL_SERVICE_NAME` | Service name for provider-side Agent Host spans |
+
+The Agent Host passes the resolved OTLP endpoint, content-capture flag, and active W3C trace context to the `@github/copilot-sdk` client. The SDK then configures the spawned Copilot CLI process with its OTel environment, so request details should show up as SDK/CLI-native spans under the Agent Host provider span. In verbose mode, the same trace context is also propagated through chat-triggered session creation and action dispatch so host lifecycle spans stay connected to the chat submission that caused them.
+
+Workbench-side verbose spans are forwarded through the Agent Host process before export. They are not posted directly from the browser process, because local OTLP/HTTP collectors such as Aspire commonly do not allow browser CORS requests.
+
+Agent Host-owned shell tool handlers also consume the SDK-provided `traceparent` from each tool invocation. Their `vscode_agent_host.tool_handler <tool>` spans are parented under the SDK-native `execute_tool` span for the same tool call.
+
+With verbose tracing, Agent Host also emits `vscode_agent_host.sdk.*` spans for every host-owned call into `@github/copilot-sdk`, with `vscode_agent_host.sdk.call` and `vscode_agent_host.sdk.reason` attributes explaining which SDK API was called and why. Examples include `client.start`, `client.list_sessions`, `client.create_session`, `client.resume_session`, `session.send`, `session.rpc.mode.set`, `session.get_messages`, `session.abort`, `session.destroy`, `session.set_model`, `session.rpc.plan.read`, and `session.rpc.history.truncate`.
 
 ### Activation
 
@@ -185,6 +216,28 @@ invoke_agent copilot                           [~15s]
 | `error.type` | On error | `FileNotFoundError` |
 | `gen_ai.tool.call.arguments` | Opt-in (captureContent) | `{"filePath":"/src/index.ts"}` |
 | `gen_ai.tool.call.result` | Opt-in (captureContent) | `(file contents or summary)` |
+
+### Agent Host Traces
+
+Agent Host OTel emits `invoke_agent copilotcli` spans from the provider process. In the default agent-only mode, these spans are intended to mirror the Copilot CLI agent view: provider execution, tool and hook spans, turn lifecycle events, permission events, subagent events, and optional content attributes.
+
+When `chat.agentHost.otel.verboseTracing` is enabled, the workbench also emits frontend spans around the chat invocation and turn dispatch path. The workbench span context is propagated across process and transport boundaries with W3C `traceparent`/`tracestate` metadata, including chat-triggered session creation, so the provider-side `invoke_agent copilotcli` span is parented into the same trace. Verbose mode also emits host-internal spans such as `vscode_agent_host.create_session`, `vscode_agent_host.list_sessions`, `vscode_agent_host.materialize_provisional`, and grouped `vscode_agent_host.db.*` spans around session metadata reads/writes.
+
+Agent Host spans use the standard GenAI attributes where possible plus VS Code-specific attributes such as:
+
+| Attribute | Description |
+|---|---|
+| `vscode_agent_host.session_id` | Agent Host session id |
+| `vscode_agent_host.chat_session_id` | Workbench chat session resource |
+| `vscode_agent_host.provider` | Agent provider, for example `copilotcli` |
+| `vscode_agent_host.operation` | Host-internal operation name |
+| `vscode_agent_host.sdk.call` | SDK API invoked by a host-owned SDK call span |
+| `vscode_agent_host.sdk.reason` | Why the host invoked that SDK API |
+| `vscode_agent_host.turn_id` | Chat turn id |
+| `vscode_agent_host.session_count` | Number of sessions observed by a host operation |
+| `vscode_agent_host.db.hit` | Whether session metadata database lookup found a database |
+| `vscode_agent_host.db.key_count` | Number of metadata keys read or written |
+| `vscode_agent_host.verbose` | Indicates a verbose frontend span |
 
 ### Metrics
 

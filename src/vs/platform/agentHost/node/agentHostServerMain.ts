@@ -56,6 +56,8 @@ import { AgentPluginManager } from './agentPluginManager.js';
 import { IAgentPluginManager } from '../common/agentPluginManager.js';
 import { registerPendingEditContentProvider } from './copilot/pendingEditContentStore.js';
 import { AgentHostGitService, IAgentHostGitService } from './agentHostGitService.js';
+import { IAgentHostOTelService } from '../common/otel/agentHostOTelService.js';
+import { AgentHostOTelService, createAgentHostOTelService } from './otel/agentHostOTelService.js';
 
 /** Log to stderr so messages appear in the terminal alongside the process. */
 function log(msg: string): void {
@@ -184,11 +186,16 @@ async function main(): Promise<void> {
 	diServices.set(ILogService, logService);
 	diServices.set(IFileService, fileService);
 	diServices.set(ISessionDataService, sessionDataService);
+	const agentHostOTelService = createAgentHostOTelService(logService);
+	if (agentHostOTelService instanceof AgentHostOTelService) {
+		disposables.add(agentHostOTelService);
+	}
+	diServices.set(IAgentHostOTelService, agentHostOTelService);
 	const instantiationService = new InstantiationService(diServices);
 	const gitService = instantiationService.createInstance(AgentHostGitService);
 
 	// Create the agent service (owns AgentHostStateManager + AgentSideEffects internally)
-	const agentService = new AgentService(logService, fileService, sessionDataService, productService, gitService, rootConfigResource);
+	const agentService = new AgentService(logService, fileService, sessionDataService, productService, gitService, rootConfigResource, agentHostOTelService);
 	disposables.add(agentService);
 
 	// Register agents

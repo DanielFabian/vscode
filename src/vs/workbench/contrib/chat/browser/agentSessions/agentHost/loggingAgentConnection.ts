@@ -7,7 +7,7 @@ import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable, IReference, toDisposable } from '../../../../../../base/common/lifecycle.js';
 import { URI, UriComponents } from '../../../../../../base/common/uri.js';
 import { Registry } from '../../../../../../platform/registry/common/platform.js';
-import { IAgentConnection, IAgentCreateSessionConfig, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, AgentHostIpcLoggingSettingId } from '../../../../../../platform/agentHost/common/agentService.js';
+import { IAgentConnection, IAgentCreateSessionConfig, IAgentDispatchOptions, IAgentResolveSessionConfigParams, IAgentSessionConfigCompletionsParams, IAgentSessionMetadata, AuthenticateParams, AuthenticateResult, AgentHostIpcLoggingSettingId } from '../../../../../../platform/agentHost/common/agentService.js';
 import type { IAgentSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
 import { StateComponents, type ComponentToState, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
 import type { ActionEnvelope, IRootConfigChangedAction, SessionAction, TerminalAction, INotification } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
@@ -180,8 +180,8 @@ export class LoggingAgentConnection extends Disposable implements IAgentConnecti
 		return this._logCall('listSessions', undefined, () => this._inner.listSessions());
 	}
 
-	async createSession(config?: IAgentCreateSessionConfig): Promise<URI> {
-		return this._logCall('createSession', config, () => this._inner.createSession(config));
+	async createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI> {
+		return this._logCall('createSession', config, () => this._inner.createSession(config, options));
 	}
 
 	async resolveSessionConfig(params: IAgentResolveSessionConfigParams): Promise<ResolveSessionConfigResult> {
@@ -220,9 +220,9 @@ export class LoggingAgentConnection extends Disposable implements IAgentConnecti
 		return this._inner.getSubscriptionUnmanaged(kind, resource);
 	}
 
-	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction): void {
+	dispatch(action: SessionAction | TerminalAction | IRootConfigChangedAction, options?: IAgentDispatchOptions): void {
 		this._log('>>', 'dispatch', action);
-		this._inner.dispatch(action);
+		this._inner.dispatch(action, options);
 	}
 
 	async resourceList(uri: URI): Promise<ResourceListResult> {

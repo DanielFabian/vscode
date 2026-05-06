@@ -1502,6 +1502,7 @@ export default tseslint.config(
 						'@vscode/proxy-agent',
 						'@vscode/spdlog',
 						'@vscode/windows-process-tree',
+						'async_hooks',
 						'assert',
 						'child_process',
 						'console',

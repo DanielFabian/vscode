@@ -791,6 +791,11 @@ let fixtureRenderCounter = 0;
 // stashed here and rethrown from the next fixture render.
 let pendingLeakErrorToThrow: Error | undefined;
 
+function isExplorerUiRenderContext(context: object): boolean {
+	const host = Object.getOwnPropertyDescriptor(context, 'host')?.value;
+	return typeof host === 'object' && host !== null && Object.getOwnPropertyDescriptor(host, 'kind')?.value === 'explorer-ui';
+}
+
 /**
  * Creates Dark and Light fixture variants from a single render function.
  * The render function receives a context with container and disposableStore.
@@ -816,14 +821,15 @@ export function defineComponentFixture(options: ComponentFixtureOptions): Themed
 			}
 
 			const disposableStore = new DisposableStore();
+			const isExplorerUi = isExplorerUiRenderContext(context);
 
 			// Do not enable virtual time in explorer ui, as multiple fixtures are rendered in parallel.
-			const virtualTimeEnabled = (options.virtualTime?.enabled ?? true) && context.host.kind !== 'explorer-ui';
+			const virtualTimeEnabled = (options.virtualTime?.enabled ?? true) && !isExplorerUi;
 
 			// Detect disposable leaks the same way unit tests do (`ensureNoDisposablesAreLeakedInTestSuite`).
 			// The tracker is global and therefore unsafe when fixtures render in parallel,
 			// so it is only enabled outside the explorer UI (e.g. in screenshot/CI mode).
-			const leakDetectionEnabled = false && context.host.kind !== 'explorer-ui';
+			const leakDetectionEnabled = false && !isExplorerUi;
 			const tracker = leakDetectionEnabled ? new DisposableTracker() : undefined;
 			if (tracker) {
 				setDisposableTracker(tracker);

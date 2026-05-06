@@ -14,7 +14,10 @@ import { autorun, autorunPerKeyedItem, derived, IObservable, observableValue, tr
 import { extUriBiasedIgnorePathCase, isEqual } from '../../../../../../base/common/resources.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { localize } from '../../../../../../nls.js';
-import { AgentProvider, AgentSession, type IAgentConnection } from '../../../../../../platform/agentHost/common/agentService.js';
+import { AgentProvider, AgentSession, type IAgentConnection, type IAgentDispatchOptions } from '../../../../../../platform/agentHost/common/agentService.js';
+import { AgentHostOTelAttr } from '../../../../../../platform/agentHost/common/otel/agentHostOTelAttributes.js';
+import { AgentHostSpanStatusCode, IAgentHostOTelService, type IAgentHostSpanHandle } from '../../../../../../platform/agentHost/common/otel/agentHostOTelService.js';
+import { AgentHostOTelTracer, AgentHostVerboseTrace } from '../../../../../../platform/agentHost/common/otel/agentHostOTelTracing.js';
 import { SessionConfigKey } from '../../../../../../platform/agentHost/common/sessionConfigKeys.js';
 import { IAgentSubscription, observableFromSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
 import { SessionTruncatedAction } from '../../../../../../platform/agentHost/common/state/protocol/actions.js';
@@ -378,6 +381,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		@ILanguageModelToolsService private readonly _toolsService: ILanguageModelToolsService,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 		@IChatWidgetService private readonly _chatWidgetService: IChatWidgetService,
+		@IAgentHostOTelService private readonly _agentHostOTelService: IAgentHostOTelService,
 		@ILanguageModelsService private readonly _languageModelsService: ILanguageModelsService,
 	) {
 		super();
@@ -645,9 +649,24 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		cancellationToken: CancellationToken,
 	): Promise<IChatAgentResult> {
 		this._logService.info(`[AgentHost] _invokeAgent called for resource: ${request.sessionResource.toString()}`);
+		return new AgentHostOTelTracer(this._agentHostOTelService).traceActiveVerbose(AgentHostVerboseTrace.ChatInvoke, span => this._invokeAgentCore(request, progress, cancellationToken, span), {
+			[AgentHostOTelAttr.CHAT_SESSION_ID]: request.sessionResource.toString(),
+			[AgentHostOTelAttr.TURN_ID]: request.requestId,
+			[AgentHostOTelAttr.REQUEST_MESSAGE_LENGTH]: request.message.length,
+		});
+	}
 
+	private async _invokeAgentCore(
+		request: IChatAgentRequest,
+		progress: (parts: IChatProgress[]) => void,
+		cancellationToken: CancellationToken,
+		span?: IAgentHostSpanHandle,
+	): Promise<IChatAgentResult> {
 		const resolvedSession = this._resolveSessionUri(request.sessionResource);
 		const sessionKey = resolvedSession.toString();
+		span?.setAttribute(AgentHostOTelAttr.SESSION_ID, AgentSession.id(resolvedSession));
+		const traceContext = span?.getSpanContext();
+		const dispatchOptions = traceContext ? { traceContext } : undefined;
 
 		// The sessions provider may have eagerly created this session at
 		// folder-pick time and is holding the connection-level subscription
@@ -657,13 +676,15 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		const existingState = this._readEagerlyCreatedSessionState(resolvedSession);
 
 		if (!existingState) {
+			span?.addEvent('session.create_and_subscribe');
 			// Eager-create did not produce server-side state (e.g. no
 			// sessions provider involved, agent host not connected at
 			// folder-pick time, or this session was created via a legacy/
 			// test path). Fall back to the original create-then-subscribe
 			// flow.
-			await this._createAndSubscribe(request.sessionResource, this._createModelSelection(request.userSelectedModelId, request.modelConfiguration), undefined, request.agentHostSessionConfig, getAgentHostBranchNameHint(request.message));
+			await this._createAndSubscribe(request.sessionResource, this._createModelSelection(request.userSelectedModelId, request.modelConfiguration), undefined, request.agentHostSessionConfig, getAgentHostBranchNameHint(request.message), dispatchOptions);
 		} else {
+			span?.addEvent('session.subscribe_existing');
 			// Eager-created session: take a refcounted subscription so the
 			// handler observes state changes for the duration of the chat
 			// session, then wire up the per-turn machinery that
@@ -679,12 +700,13 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			// `replace: true` so the agent's view exactly matches the
 			// resolved values the picker computed.
 			if (request.agentHostSessionConfig && Object.keys(request.agentHostSessionConfig).length > 0) {
+				span?.addEvent('session.config.dispatch');
 				this._dispatchAction({
 					type: ActionType.SessionConfigChanged,
 					session: sessionKey,
 					config: request.agentHostSessionConfig,
 					replace: true,
-				});
+				}, dispatchOptions);
 			}
 
 			// Claim the active-client role and publish current tools +
@@ -692,7 +714,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			// sessions provider couldn't include them because the handler
 			// owns them; this dispatch is the equivalent of the
 			// `activeClient` parameter on the legacy createSession call.
-			this._dispatchActiveClient(resolvedSession, this._config.customizations?.get() ?? []);
+			span?.addEvent('session.active_client.dispatch');
+			this._dispatchActiveClient(resolvedSession, this._config.customizations?.get() ?? [], dispatchOptions);
 		}
 
 		await this._handleTurn(resolvedSession, request, progress, cancellationToken);
@@ -809,8 +832,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		}
 	}
 
-	private _dispatchAction(action: ClientSessionAction): void {
-		this._config.connection.dispatch(action);
+	private _dispatchAction(action: ClientSessionAction, options?: IAgentDispatchOptions): void {
+		this._config.connection.dispatch(action, options);
 	}
 
 	/**
@@ -818,7 +841,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 	 * role for this session and publish the current customizations and
 	 * client-provided tools.
 	 */
-	private _dispatchActiveClient(backendSession: URI, customizations: CustomizationRef[]): void {
+	private _dispatchActiveClient(backendSession: URI, customizations: CustomizationRef[], options?: IAgentDispatchOptions): void {
 		this._dispatchAction({
 			type: ActionType.SessionActiveClientChanged,
 			session: backendSession.toString(),
@@ -827,7 +850,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				tools: this._clientToolsObs.get().map(toolDataToDefinition),
 				customizations,
 			},
-		});
+		}, options);
 	}
 
 	// ---- Server-initiated turn detection ------------------------------------
@@ -950,8 +973,27 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		}
 
 		const turnId = request.requestId;
-		this._clientDispatchedTurnIds.add(turnId);
 		const messageAttachments = this._convertVariablesToAttachments(request);
+		return new AgentHostOTelTracer(this._agentHostOTelService, { sessionId: AgentSession.id(session), turnId }).traceVerbose(AgentHostVerboseTrace.ChatTurn, span => this._handleTurnCore(session, request, progress, cancellationToken, turnId, messageAttachments, span), {
+			[AgentHostOTelAttr.CHAT_SESSION_ID]: request.sessionResource.toString(),
+			[AgentHostOTelAttr.REQUEST_MESSAGE_LENGTH]: request.message.length,
+			[AgentHostOTelAttr.REQUEST_ATTACHMENT_COUNT]: messageAttachments.length,
+		}, undefined, { setOkStatus: false });
+	}
+
+	private async _handleTurnCore(
+		session: URI,
+		request: IChatAgentRequest,
+		progress: (parts: IChatProgress[]) => void,
+		cancellationToken: CancellationToken,
+		turnId: string,
+		messageAttachments: MessageAttachment[],
+		verboseSpan?: IAgentHostSpanHandle,
+	): Promise<void> {
+		this._clientDispatchedTurnIds.add(turnId);
+		const traceContext = verboseSpan?.getSpanContext();
+		let verboseSpanStatus = AgentHostSpanStatusCode.OK;
+		let verboseSpanStatusMessage: string | undefined;
 
 		// If the user selected a different model since the session was created
 		// (or since the last turn), dispatch a model change action first so the
@@ -964,7 +1006,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 					type: ActionType.SessionModelChanged,
 					session: session.toString(),
 					model: selectedModel,
-				});
+				}, traceContext ? { traceContext } : undefined);
 			}
 		}
 
@@ -982,7 +1024,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 					type: ActionType.SessionTruncated,
 					session: session.toString(),
 				};
-				this._config.connection.dispatch(truncateAction);
+				this._config.connection.dispatch(truncateAction, traceContext ? { traceContext } : undefined);
 			} else {
 				const seenAtIndex = protocolState.turns.findIndex(t => t.id === previousRequest!.id);
 				if (seenAtIndex !== -1 && seenAtIndex < protocolState.turns.length - 1) {
@@ -991,7 +1033,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 						session: session.toString(),
 						turnId: previousRequest!.id,
 					};
-					this._config.connection.dispatch(truncateAction);
+					this._config.connection.dispatch(truncateAction, traceContext ? { traceContext } : undefined);
 				}
 			}
 		}
@@ -1007,7 +1049,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				attachments: messageAttachments.length > 0 ? messageAttachments : undefined,
 			},
 		};
-		this._config.connection.dispatch(turnAction);
+		verboseSpan?.addEvent('session.turn_started.dispatch');
+		this._config.connection.dispatch(turnAction, traceContext ? { traceContext } : undefined);
 
 		// Ensure the editing session records a sentinel checkpoint for this
 		// request so it appears in requestDisablement even if the turn
@@ -1025,11 +1068,14 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 			const cancelSub = store.add(cancellationToken.onCancellationRequested(() => {
 				cancelSub.dispose();
 				this._logService.info(`[AgentHost] Cancellation requested for ${session.toString()}, dispatching turnCancelled`);
+				verboseSpan?.addEvent('session.turn_cancelled.dispatch');
 				this._config.connection.dispatch({
 					type: ActionType.SessionTurnCancelled,
 					session: session.toString(),
 					turnId,
-				});
+				}, traceContext ? { traceContext } : undefined);
+				verboseSpanStatus = AgentHostSpanStatusCode.ERROR;
+				verboseSpanStatusMessage = 'cancelled';
 			}));
 
 			store.add(this._observeTurn({
@@ -1042,6 +1088,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 					store.dispose();
 					this._clientDispatchedTurnIds.delete(turnId);
 					this._activeSessions.get(request.sessionResource)?.isCompleteObs.set(true, undefined);
+					verboseSpan?.setStatus(verboseSpanStatus, verboseSpanStatusMessage);
 					resolve();
 				},
 				onFileEdits: (tc) => {
@@ -2200,7 +2247,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 	}
 
 	/** Creates a new backend session and subscribes to its state. */
-	private async _createAndSubscribe(sessionResource: URI, model: ModelSelection | undefined, fork?: { session: URI; turnIndex: number; turnId: string }, sessionConfig?: Record<string, unknown>, branchNameHint?: string): Promise<URI> {
+	private async _createAndSubscribe(sessionResource: URI, model: ModelSelection | undefined, fork?: { session: URI; turnIndex: number; turnId: string }, sessionConfig?: Record<string, unknown>, branchNameHint?: string, options?: IAgentDispatchOptions): Promise<URI> {
 		const config = branchNameHint ? { ...sessionConfig, [SessionConfigKey.BranchNameHint]: branchNameHint } : sessionConfig;
 		const workingDirectory = this._resolveRequestedWorkingDirectory(sessionResource);
 		const requestedSession = fork ? undefined : this._resolveSessionUri(sessionResource);
@@ -2236,7 +2283,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 				fork,
 				config,
 				activeClient,
-			});
+			}, options);
 		} catch (err) {
 			// If authentication is required (e.g. token expired), try interactive auth and retry once
 			if (this._isAuthRequiredError(err) && this._config.resolveAuthentication) {
@@ -2251,7 +2298,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 						fork,
 						config,
 						activeClient,
-					});
+					}, options);
 				} else {
 					throw new Error(localize('agentHost.authRequired', "Authentication is required to start a session. Please sign in and try again."));
 				}

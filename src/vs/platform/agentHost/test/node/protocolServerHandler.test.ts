@@ -10,7 +10,8 @@ import { URI } from '../../../../base/common/uri.js';
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { type IAgentCreateSessionConfig, type IAgentResolveSessionConfigParams, type IAgentService, type IAgentSessionConfigCompletionsParams, type IAgentSessionMetadata, type AuthenticateParams, type AuthenticateResult } from '../../common/agentService.js';
+import { type IAgentCreateSessionConfig, type IAgentDispatchOptions, type IAgentResolveSessionConfigParams, type IAgentService, type IAgentSessionConfigCompletionsParams, type IAgentSessionMetadata, type AuthenticateParams, type AuthenticateResult } from '../../common/agentService.js';
+import type { AgentHostTraceContext } from '../../common/otel/agentHostTraceContext.js';
 import { CompletionsParams, CompletionsResult, ListSessionsResult, ResourceReadResult, ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import { ActionType, type IRootConfigChangedAction, type SessionAction, type TerminalAction } from '../../common/state/sessionActions.js';
 import { PROTOCOL_VERSION } from '../../common/state/protocol/version/registry.js';
@@ -74,6 +75,8 @@ class MockAgentService implements IAgentService {
 	readonly browseErrors = new Map<string, Error>();
 	readonly listedSessions: IAgentSessionMetadata[] = [];
 	readonly createSessionConfigs: (IAgentCreateSessionConfig | undefined)[] = [];
+	readonly dispatchTraceContexts: (AgentHostTraceContext | undefined)[] = [];
+	readonly createSessionTraceContexts: (AgentHostTraceContext | undefined)[] = [];
 
 	private readonly _onDidAction = new Emitter<import('../../common/state/sessionActions.js').ActionEnvelope>();
 	readonly onDidAction = this._onDidAction.event;
@@ -87,13 +90,16 @@ class MockAgentService implements IAgentService {
 		this._stateManager = sm;
 	}
 
-	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number): void {
+	dispatchAction(action: SessionAction | TerminalAction | IRootConfigChangedAction, clientId: string, clientSeq: number, options?: IAgentDispatchOptions): void {
 		this.handledActions.push(action);
+		this.dispatchTraceContexts.push(options?.traceContext);
 		const origin = { clientId, clientSeq };
 		this._stateManager.dispatchClientAction(action, origin);
 	}
-	async createSession(config?: IAgentCreateSessionConfig): Promise<URI> {
+	emitOTelSpan(): void { }
+	async createSession(config?: IAgentCreateSessionConfig, options?: IAgentDispatchOptions): Promise<URI> {
 		this.createSessionConfigs.push(config);
+		this.createSessionTraceContexts.push(options?.traceContext);
 		const session = config?.session ?? URI.parse('copilot:///new-session');
 		this._stateManager.createSession({
 			resource: session.toString(),
@@ -317,6 +323,55 @@ suite('ProtocolServerHandler', () => {
 		const envelope = turnStarted!.params as unknown as { origin: { clientId: string; clientSeq: number } };
 		assert.strictEqual(envelope.origin.clientId, 'client-1');
 		assert.strictEqual(envelope.origin.clientSeq, 1);
+	});
+
+	test('dispatchAction accepts trace context extension metadata', () => {
+		stateManager.createSession(makeSessionSummary());
+		stateManager.dispatchServerAction({ type: ActionType.SessionReady, session: sessionUri });
+
+		const transport = connectClient('client-1', [sessionUri]);
+		transport.sent.length = 0;
+
+		transport.simulateMessage(notification('dispatchAction', {
+			clientSeq: 1,
+			traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+			tracestate: 'vendor=value',
+			action: {
+				type: ActionType.SessionTurnStarted,
+				session: sessionUri,
+				turnId: 'turn-1',
+				userMessage: { text: 'hello' },
+			},
+		}));
+
+		assert.deepStrictEqual(agentService.dispatchTraceContexts, [{
+			traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+			spanId: '00f067aa0ba902b7',
+			traceFlags: 1,
+			traceState: 'vendor=value',
+		}]);
+	});
+
+	test('createSession accepts trace context extension metadata', async () => {
+		const newSession = 'copilot:///new-session';
+		const transport = connectClient('client-1');
+		transport.sent.length = 0;
+
+		const responsePromise = waitForResponse(transport, 2);
+		transport.simulateMessage(request(2, 'createSession', {
+			session: newSession,
+			provider: 'copilot',
+			traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+			tracestate: 'vendor=value',
+		}));
+
+		await responsePromise;
+		assert.deepStrictEqual(agentService.createSessionTraceContexts, [{
+			traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+			spanId: '00f067aa0ba902b7',
+			traceFlags: 1,
+			traceState: 'vendor=value',
+		}]);
 	});
 
 	test('actions are scoped to subscribed sessions', () => {
