@@ -27,6 +27,7 @@ import * as Constants from '../common/constants.js';
 import { SearchChatContextContribution } from './searchChatContext.js';
 
 import './searchActionsCopy.js';
+import './searchActionsExport.js';
 import './searchActionsFind.js';
 import './searchActionsNav.js';
 import './searchActionsRemoveReplace.js';
