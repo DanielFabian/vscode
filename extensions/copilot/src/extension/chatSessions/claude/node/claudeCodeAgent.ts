@@ -35,6 +35,7 @@ import { ClaudeSettingsChangeTracker } from './claudeSettingsChangeTracker';
 import { ParsedClaudeModelId } from '../common/claudeModelId';
 import { IClaudeSessionStateService } from '../common/claudeSessionStateService';
 import { ClaudeOTelTracker } from './claudeOTelTracker';
+import { rgBinDir } from '../../common/ripgrep';
 
 // Manages Claude Code agent interactions and language model server lifecycle
 export class ClaudeAgentManager extends Disposable {
@@ -403,6 +404,7 @@ export class ClaudeCodeSession extends Disposable {
 		// Build options for the Claude Code SDK
 		this.logService.trace(`appRoot: ${this.envService.appRoot}`);
 		const pathSep = isWindows ? ';' : ':';
+		const rgBinDirPath = rgBinDir(this.envService.appRoot);
 		const mcpServers: Record<string, McpServerConfig> = await buildMcpServersFromRegistry(this.instantiationService) ?? {};
 
 		// Create or reuse the MCP gateway for this session
@@ -470,7 +472,7 @@ export class ClaudeCodeSession extends Disposable {
 					ANTHROPIC_AUTH_TOKEN: `${serverConfig.nonce}.${this.sessionId}`,
 					CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
 					USE_BUILTIN_RIPGREP: '0',
-					PATH: `${this.envService.appRoot}/node_modules/@vscode/ripgrep/bin${pathSep}${process.env.PATH}`,
+					PATH: `${rgBinDirPath}${pathSep}${process.env.PATH}`,
 					// Forward OTel configuration to the Claude SDK subprocess
 					...deriveClaudeOTelEnv(this._otelService.config),
 				},
