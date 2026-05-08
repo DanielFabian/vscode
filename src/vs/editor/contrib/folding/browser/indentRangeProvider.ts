@@ -129,7 +129,8 @@ export function computeRanges(model: ITextModel, offSide: boolean, markers?: Fol
 
 	let pattern: RegExp | undefined = undefined;
 	if (markers) {
-		pattern = new RegExp(`(${markers.start.source})|(?:${markers.end.source})`);
+		const flags = [...new Set([...markers.start.flags, ...markers.end.flags])].join('');
+		pattern = new RegExp(`(${markers.start.source})|(?:${markers.end.source})`, flags);
 	}
 
 	const previousRegions: PreviousRegion[] = [];
