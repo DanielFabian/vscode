@@ -5,8 +5,8 @@
 
 import type { CCAModel } from '@vscode/copilot-api';
 import type { Options, SDKSessionInfo, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import { rgPath } from '@vscode/ripgrep';
 import { SequencerByKey } from '../../../../base/common/async.js';
+import { rgDiskPath } from '../../../../base/node/ripgrep.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable, DisposableMap } from '../../../../base/common/lifecycle.js';
@@ -476,17 +476,13 @@ export class ClaudeAgent extends Disposable implements IAgent {
 		// `Options.settings.env` channel (separate from `Options.env` which
 		// is the spawn env). PATH composition uses `delimiter` (`:` or `;`)
 		// so Windows agent hosts don't corrupt PATH on subprocess fork.
-		// In packaged builds @vscode/ripgrep lives inside node_modules.asar; the
-		// rg binary itself is unpacked next door, so rewrite the path before
-		// putting it on PATH (matches `copilotAgent.ts` and the workbench
-		// search engine helpers).
-		const rgDiskPath = rgPath.replace(/\bnode_modules\.asar\b/, 'node_modules.asar.unpacked');
+		const resolvedRgDiskPath = await rgDiskPath();
 		const settingsEnv: Record<string, string> = {
 			ANTHROPIC_BASE_URL: proxyHandle.baseUrl,
 			ANTHROPIC_AUTH_TOKEN: `${proxyHandle.nonce}.${sessionId}`,
 			CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
 			USE_BUILTIN_RIPGREP: '0',
-			PATH: `${dirname(rgDiskPath)}${delimiter}${process.env.PATH ?? ''}`,
+			PATH: `${dirname(resolvedRgDiskPath)}${delimiter}${process.env.PATH ?? ''}`,
 		};
 
 		const options: Options = {
