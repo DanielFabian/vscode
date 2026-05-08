@@ -58,9 +58,14 @@
 }
 
 .monaco-workbench .simple-find-part .matchesCount {
-	width: 73px;
-	max-width: 73px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
 	min-width: 73px;
+	max-width: 122px;
 	padding-left: 5px;
 }
 
