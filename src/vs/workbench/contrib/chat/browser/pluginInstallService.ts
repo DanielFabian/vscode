@@ -304,6 +304,11 @@ export class PluginInstallService implements IPluginInstallService {
 
 			await Promise.all(gitTasks);
 
+			// Invalidate the GitHub API response cache so the re-fetch
+			// below picks up newly added or removed plugins rather than
+			// returning stale cached data.
+			this._pluginMarketplaceService.invalidateGitHubCache();
+
 			// 2. Re-fetch marketplace data *after* pulling so we see any
 			//    updated plugin descriptors (new versions, refs, etc.).
 			const marketplacePlugins = await this._pluginMarketplaceService.fetchMarketplacePlugins(token);

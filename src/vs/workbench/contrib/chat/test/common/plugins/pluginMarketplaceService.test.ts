@@ -14,7 +14,7 @@ import { IFileService } from '../../../../../../platform/files/common/files.js';
 import { TestInstantiationService } from '../../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { ILogService, NullLogService } from '../../../../../../platform/log/common/log.js';
 import { IRequestService } from '../../../../../../platform/request/common/request.js';
-import { IStorageService, InMemoryStorageService } from '../../../../../../platform/storage/common/storage.js';
+import { IStorageService, InMemoryStorageService, StorageScope, StorageTarget } from '../../../../../../platform/storage/common/storage.js';
 import { IWorkspaceTrustManagementService } from '../../../../../../platform/workspace/common/workspaceTrust.js';
 import { IEnvironmentService } from '../../../../../../platform/environment/common/environment.js';
 import { ChatConfiguration } from '../../../common/constants.js';
@@ -354,6 +354,66 @@ suite('PluginMarketplaceService - installed plugins lifecycle', () => {
 		const remaining = service.installedPlugins.get();
 		assert.strictEqual(remaining.length, 1);
 		assert.strictEqual(remaining[0].plugin.name, 'plugin-b');
+	});
+});
+
+suite('PluginMarketplaceService - invalidateGitHubCache', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+	const GITHUB_CACHE_KEY = 'chat.plugins.marketplaces.githubCache.v1';
+
+	function createServiceWithStorage(): { service: PluginMarketplaceService; storageService: InMemoryStorageService } {
+		const instantiationService = store.add(new TestInstantiationService());
+		const storageService = store.add(new InMemoryStorageService());
+
+		instantiationService.stub(IConfigurationService, new TestConfigurationService({
+			[ChatConfiguration.PluginMarketplaces]: ['microsoft/plugins'],
+			[ChatConfiguration.PluginsEnabled]: true,
+		}));
+		instantiationService.stub(IEnvironmentService, { cacheHome: URI.file('/cache') } as Partial<IEnvironmentService> as IEnvironmentService);
+		instantiationService.stub(IFileService, {} as unknown as IFileService);
+		instantiationService.stub(IAgentPluginRepositoryService, { agentPluginsHome: URI.file('/agent-plugins') } as unknown as IAgentPluginRepositoryService);
+		instantiationService.stub(ILogService, new NullLogService());
+		instantiationService.stub(IRequestService, {} as unknown as IRequestService);
+		instantiationService.stub(IStorageService, storageService);
+		instantiationService.stub(IWorkspacePluginSettingsService, {
+			extraMarketplaces: observableValue('test.extraMarketplaces', []),
+			enabledPlugins: observableValue('test.enabledPlugins', new Map()),
+		} as Partial<IWorkspacePluginSettingsService> as IWorkspacePluginSettingsService);
+		instantiationService.stub(IWorkspaceTrustManagementService, {
+			isWorkspaceTrusted: () => true,
+			onDidChangeTrust: Event.None,
+		} as Partial<IWorkspaceTrustManagementService> as IWorkspaceTrustManagementService);
+
+		const service = store.add(instantiationService.createInstance(PluginMarketplaceService));
+		return { service, storageService };
+	}
+
+	test('clears persisted GitHub cache entries', () => {
+		const { service, storageService } = createServiceWithStorage();
+
+		// Seed a cache entry in storage as if a previous fetch had cached it.
+		const reference = parseMarketplaceReference('microsoft/plugins')!;
+		const cacheData = JSON.stringify({
+			[reference.canonicalId]: {
+				expiresAt: Date.now() + 8 * 60 * 60 * 1000,
+				referenceRawValue: 'microsoft/plugins',
+				plugins: [{ name: 'test-plugin', description: '', version: '1.0.0', source: './test/' }],
+			}
+		});
+		storageService.store(GITHUB_CACHE_KEY, cacheData, StorageScope.APPLICATION, StorageTarget.MACHINE);
+		assert.ok(storageService.get(GITHUB_CACHE_KEY, StorageScope.APPLICATION), 'cache should be populated before invalidation');
+
+		service.invalidateGitHubCache();
+
+		assert.strictEqual(storageService.get(GITHUB_CACHE_KEY, StorageScope.APPLICATION), undefined, 'cache should be cleared after invalidation');
+	});
+
+	test('is a no-op when no cache exists', () => {
+		const { service, storageService } = createServiceWithStorage();
+
+		assert.strictEqual(storageService.get(GITHUB_CACHE_KEY, StorageScope.APPLICATION), undefined);
+		service.invalidateGitHubCache();
+		assert.strictEqual(storageService.get(GITHUB_CACHE_KEY, StorageScope.APPLICATION), undefined);
 	});
 });
 
