@@ -2372,6 +2372,9 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
 	}
 
 	async rename(title?: string, source?: TitleEventSource) {
+		if (title !== undefined && !title) {
+			title = undefined;
+		}
 		this._setTitle(title, source ?? TitleEventSource.Api);
 	}
 
