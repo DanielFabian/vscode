@@ -1646,6 +1646,14 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 		}
 		return getToolFullReferenceName(tool, toolSet);
 	}
+
+	getFullReferenceNameMap(): Map<IToolData | IToolSet, string> {
+		const result = new Map<IToolData | IToolSet, string>();
+		for (const [item, toolFullReferenceName] of this.toolsWithFullReferenceName.get()) {
+			result.set(item, toolFullReferenceName);
+		}
+		return result;
+	}
 }
 
 function getToolFullReferenceName(tool: IToolData, toolSet?: IToolSet) {
