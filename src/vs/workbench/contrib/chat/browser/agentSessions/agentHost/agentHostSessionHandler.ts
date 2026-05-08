@@ -49,6 +49,7 @@ import { ILanguageModelToolsService, IToolData, IToolInvocation, IToolResult, To
 import { getAgentHostIcon } from '../agentSessions.js';
 import { AgentHostEditingSession } from './agentHostEditingSession.js';
 import { IAgentHostSessionWorkingDirectoryResolver } from './agentHostSessionWorkingDirectoryResolver.js';
+import { IAgentHostUntitledProvisionalSessionService } from './agentHostUntitledProvisionalSessionService.js';
 import { activeTurnToProgress, completedToolCallToEditParts, completedToolCallToSerialized, finalizeToolInvocation, getTerminalContentUri, isSubagentTool, makeAhpTerminalToolSessionId, parseAhpTerminalToolSessionId, rawMarkdownToString, stringOrMarkdownToString, toolCallStateToInvocation, turnsToHistory, updateRunningToolSpecificData, type IToolCallFileEdit, type TurnModelLookup } from './stateToProgressAdapter.js';
 
 // =============================================================================
@@ -385,6 +386,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		@ITerminalChatService private readonly _terminalChatService: ITerminalChatService,
 		@IAgentHostTerminalService private readonly _agentHostTerminalService: IAgentHostTerminalService,
 		@IAgentHostSessionWorkingDirectoryResolver private readonly _workingDirectoryResolver: IAgentHostSessionWorkingDirectoryResolver,
+		@IAgentHostUntitledProvisionalSessionService private readonly _provisionalService: IAgentHostUntitledProvisionalSessionService,
 		@ILanguageModelToolsService private readonly _toolsService: ILanguageModelToolsService,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 		@IChatWidgetService private readonly _chatWidgetService: IChatWidgetService,
@@ -717,6 +719,16 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 
 		const resolvedSession = this._resolveSessionUri(request.sessionResource);
 		const sessionKey = resolvedSession.toString();
+
+		// The chat-input picker may have pre-created a provisional session
+		// against this resource (`IAgentHostUntitledProvisionalSessionService.getOrCreate`).
+		// In that case the agent already has the session + the user's chip
+		// selections in `state.config.values`; ensure we hold a refcounted
+		// subscription on it so the rest of the handler observes those.
+		const provisionalBackend = this._provisionalService.get(request.sessionResource);
+		if (provisionalBackend) {
+			this._ensureSessionSubscription(sessionKey);
+		}
 
 		// The sessions provider may have eagerly created this session at
 		// folder-pick time and is holding the connection-level subscription
@@ -2341,9 +2353,18 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
 		// Subscribe to the new session's state
 		const newSub = this._ensureSessionSubscription(session.toString());
 		if (!this._getSessionState(session.toString())) {
-			// Wait for the subscription to hydrate
+			// Wait for the subscription to hydrate. Attach the listener
+			// before re-checking the value to close a race where another
+			// consumer (e.g. the chat-input picker) acquires the same
+			// subscription concurrently and triggers `handleSnapshot`
+			// between our `_getSessionState` check and the listener
+			// attachment.
 			await new Promise<void>(resolve => {
 				const d = newSub.onDidChange(() => { d.dispose(); resolve(); });
+				if (this._getSessionState(session.toString())) {
+					d.dispose();
+					resolve();
+				}
 			});
 		}
 
