@@ -105,6 +105,7 @@ function extractEntry(stream: Readable, fileName: string, mode: number, targetPa
 function extractZip(zipfile: ZipFile, targetPath: string, options: IOptions, token: CancellationToken): Promise<void> {
 	let last = createCancelablePromise<void>(() => Promise.resolve());
 	let extractedEntriesCount = 0;
+	let isExtracting = false;
 
 	const listener = token.onCancellationRequested(() => {
 		last.cancel();
@@ -138,6 +139,12 @@ function extractZip(zipfile: ZipFile, targetPath: string, options: IOptions, tok
 				return;
 			}
 
+			// Guard against concurrent entry processing: wait for
+			// the previous entry to finish before starting the next.
+			if (isExtracting) {
+				return;
+			}
+
 			if (!options.sourcePathRegex.test(entry.fileName)) {
 				readNextEntry(token);
 				return;
@@ -155,7 +162,8 @@ function extractZip(zipfile: ZipFile, targetPath: string, options: IOptions, tok
 			const stream = openZipStream(zipfile, entry);
 			const mode = modeFromEntry(entry);
 
-			last = createCancelablePromise(token => throttler.queue(() => stream.then(stream => extractEntry(stream, fileName, mode, targetPath, options, token).then(() => readNextEntry(token)))).then(null, e));
+			isExtracting = true;
+			last = createCancelablePromise(token => throttler.queue(() => stream.then(stream => extractEntry(stream, fileName, mode, targetPath, options, token).then(() => { isExtracting = false; readNextEntry(token); }))).then(null, err => { isExtracting = false; e(err); }));
 		});
 	}).finally(() => listener.dispose());
 }
@@ -230,9 +238,19 @@ export function extract(zipPath: string, targetPath: string, options: IExtractOp
 function read(zipPath: string, filePath: string): Promise<Readable> {
 	return openZip(zipPath).then(zipfile => {
 		return new Promise<Readable>((c, e) => {
+			const reject = (err: Error) => {
+				zipfile.close();
+				e(err);
+			};
+
+			zipfile.once('error', reject);
 			zipfile.on('entry', (entry: Entry) => {
 				if (entry.fileName === filePath) {
-					openZipStream(zipfile, entry).then(stream => c(stream), err => e(err));
+					openZipStream(zipfile, entry).then(stream => {
+						stream.once('end', () => zipfile.close());
+						stream.once('error', () => zipfile.close());
+						c(stream);
+					}, err => reject(err));
 				}
 			});
 
