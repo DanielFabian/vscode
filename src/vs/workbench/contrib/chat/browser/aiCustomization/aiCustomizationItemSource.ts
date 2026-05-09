@@ -26,7 +26,7 @@ import { IAgentPluginService } from '../../common/plugins/agentPluginService.js'
 import { parseHooksFromFile } from '../../common/promptSyntax/hookCompatibility.js';
 import { formatHookCommandLabel } from '../../common/promptSyntax/hookSchema.js';
 import { HOOK_METADATA } from '../../common/promptSyntax/hookTypes.js';
-import { PromptsType } from '../../common/promptSyntax/promptTypes.js';
+import { PromptsType, isValidPromptType } from '../../common/promptSyntax/promptTypes.js';
 import { IPromptsService, PromptsStorage } from '../../common/promptSyntax/service/promptsService.js';
 import { storageToIcon } from './aiCustomizationIcons.js';
 import { type AICustomizationPromptsStorage, BUILTIN_STORAGE } from './aiCustomizationManagement.js';
@@ -194,7 +194,7 @@ export class AICustomizationItemNormalizer {
 	normalizeItems(items: readonly ICustomizationItem[], promptType: PromptsType): IAICustomizationListItem[] {
 		const uriUseCounts = new ResourceMap<number>();
 		return items
-			.filter(item => item.type === promptType)
+			.filter(item => item.type === promptType || !isValidPromptType(item.type))
 			.map(item => this.normalizeItem(item, promptType, uriUseCounts))
 			.sort((a, b) => a.name.localeCompare(b.name));
 	}
@@ -354,6 +354,11 @@ export class ProviderCustomizationItemSource implements IAICustomizationItemSour
 			return [];
 		}
 
+		// Items whose type is not a recognised PromptsType (e.g. 'plugin'
+		// from AHP) are included alongside the type-matched items so they
+		// are visible in every section rather than silently dropped.
+		const untypedItems = allItems.filter(item => !isValidPromptType(item.type));
+
 		let providerItems: readonly ICustomizationItem[];
 		if (promptType === PromptsType.hook) {
 			const hookItems = allItems.filter(item => item.type === PromptsType.hook);
@@ -363,9 +368,9 @@ export class ProviderCustomizationItemSource implements IAICustomizationItemSour
 			const expanded = await expandHookFileItems(
 				toExpand, this.workspaceService, this.fileService, this.pathService,
 			);
-			providerItems = [...expanded, ...preExpanded];
+			providerItems = [...expanded, ...preExpanded, ...untypedItems];
 		} else {
-			providerItems = allItems.filter(item => item.type === promptType);
+			providerItems = [...allItems.filter(item => item.type === promptType), ...untypedItems];
 		}
 
 		if (promptType === PromptsType.skill) {
