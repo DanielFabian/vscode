@@ -64,6 +64,19 @@ suite('Snippet Variables Resolver', function () {
 		}
 	}
 
+	function createMockWorkspaceLabelService(rootPath: string): ILabelService {
+		return new class extends mock<ILabelService>() {
+			override getUriLabel(uri: URI, options: { relative?: boolean } = {}) {
+				const rootFsPath = URI.file(rootPath).fsPath + sep;
+				const fsPath = uri.fsPath;
+				if (options.relative && rootPath && fsPath.startsWith(rootFsPath)) {
+					return fsPath.substring(rootFsPath.length);
+				}
+				return fsPath;
+			}
+		};
+	}
+
 	test('editor variables, basics', function () {
 		assertVariableResolve(resolver, 'TM_FILENAME', 'text.txt');
 		assertVariableResolve(resolver, 'something', undefined);
@@ -429,30 +442,15 @@ suite('Snippet Variables Resolver', function () {
 		}
 	});
 
-	test('Add RELATIVE_FILEPATH snippet variable #114208', function () {
+	test('Add RELATIVE_FILEPATH and REVERSE_RELATIVE_FILEPATH snippet variables #114208', function () {
 
 		let resolver: VariableResolver;
-
-		// Mock a label service (only coded for file uris)
-		const workspaceLabelService = ((rootPath: string): ILabelService => {
-			const labelService = new class extends mock<ILabelService>() {
-				override getUriLabel(uri: URI, options: { relative?: boolean } = {}) {
-					const rootFsPath = URI.file(rootPath).fsPath + sep;
-					const fsPath = uri.fsPath;
-					if (options.relative && rootPath && fsPath.startsWith(rootFsPath)) {
-						return fsPath.substring(rootFsPath.length);
-					}
-					return fsPath;
-				}
-			};
-			return labelService;
-		});
 
 		const model = createTextModel('', undefined, undefined, URI.parse('file:///foo/files/text.txt'));
 
 		// empty workspace
 		resolver = new ModelBasedVariableResolver(
-			workspaceLabelService(''),
+			createMockWorkspaceLabelService(''),
 			model
 		);
 
@@ -461,10 +459,11 @@ suite('Snippet Variables Resolver', function () {
 		} else {
 			assertVariableResolve(resolver, 'RELATIVE_FILEPATH', '\\foo\\files\\text.txt');
 		}
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', undefined);
 
 		// single folder workspace
 		resolver = new ModelBasedVariableResolver(
-			workspaceLabelService('/foo'),
+			createMockWorkspaceLabelService('/foo'),
 			model
 		);
 		if (!isWindows) {
@@ -472,7 +471,96 @@ suite('Snippet Variables Resolver', function () {
 		} else {
 			assertVariableResolve(resolver, 'RELATIVE_FILEPATH', 'files\\text.txt');
 		}
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '..');
+
+		const workspaceRootModel = createTextModel('', undefined, undefined, URI.parse('file:///foo/text.txt'));
+		resolver = new ModelBasedVariableResolver(
+			createMockWorkspaceLabelService('/foo'),
+			workspaceRootModel
+		);
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '.');
+		workspaceRootModel.dispose();
+
+		const aboveWorkspaceModel = createTextModel('', undefined, undefined, URI.parse('file:///bar/text.txt'));
+		resolver = new ModelBasedVariableResolver(
+			createMockWorkspaceLabelService('/foo'),
+			aboveWorkspaceModel
+		);
+		if (!isWindows) {
+			assertVariableResolve(resolver, 'RELATIVE_FILEPATH', '/bar/text.txt');
+		} else {
+			assertVariableResolve(resolver, 'RELATIVE_FILEPATH', '\\bar\\text.txt');
+		}
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', undefined);
+		aboveWorkspaceModel.dispose();
 
 		model.dispose();
+	});
+
+	test('REVERSE_RELATIVE_FILEPATH handles deeply nested paths and platform-specific separators', function () {
+
+		const deepModel = createTextModel('', undefined, undefined, URI.parse('file:///foo/dir/sub/text.txt'));
+		let resolver: VariableResolver = new ModelBasedVariableResolver(createMockWorkspaceLabelService('/foo'), deepModel);
+		if (!isWindows) {
+			assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '../..');
+		} else {
+			assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '..\\..');
+		}
+		deepModel.dispose();
+
+		const windowsStyleLabelService = new class extends mock<ILabelService>() {
+			override getUriLabel(_uri: URI, options: { relative?: boolean } = {}) {
+				if (options.relative) {
+					return 'dir\\sub\\text.txt';
+				}
+				return '\\foo\\dir\\sub\\text.txt';
+			}
+		};
+
+		const windowsModel = createTextModel('', undefined, undefined, URI.parse('file:///foo/dir/sub/text.txt'));
+		resolver = new ModelBasedVariableResolver(windowsStyleLabelService, windowsModel);
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '..\\..');
+		windowsModel.dispose();
+	});
+
+	test('REVERSE_RELATIVE_FILEPATH handles Windows drive paths and remote scenarios', function () {
+
+		const drivePathLabelService = new class extends mock<ILabelService>() {
+			override getUriLabel(_uri: URI, options: { relative?: boolean } = {}) {
+				if (options.relative) {
+					return 'dir\\sub\\text.txt';
+				}
+				return 'C:\\workspace\\dir\\sub\\text.txt';
+			}
+		};
+
+		const windowsDriveModel = createTextModel('', undefined, undefined, URI.parse('file:///c%3A/workspace/dir/sub/text.txt'));
+		let resolver: VariableResolver = new ModelBasedVariableResolver(drivePathLabelService, windowsDriveModel);
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '..\\..');
+		windowsDriveModel.dispose();
+
+		const remoteModel = createTextModel('', undefined, undefined, URI.parse('vscode-remote://ssh-remote%2Bexample/home/user/workspace/dir/file.ts'));
+		const remoteWorkspaceLabelService = new class extends mock<ILabelService>() {
+			override getUriLabel(_uri: URI, options: { relative?: boolean } = {}) {
+				if (options.relative) {
+					return 'dir/file.ts';
+				}
+				return '/home/user/workspace/dir/file.ts';
+			}
+		};
+		resolver = new ModelBasedVariableResolver(remoteWorkspaceLabelService, remoteModel);
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', '..');
+
+		const remoteExternalLabelService = new class extends mock<ILabelService>() {
+			override getUriLabel(_uri: URI, options: { relative?: boolean } = {}) {
+				if (options.relative) {
+					return '/home/user/other/place/file.ts';
+				}
+				return '/home/user/other/place/file.ts';
+			}
+		};
+		resolver = new ModelBasedVariableResolver(remoteExternalLabelService, remoteModel);
+		assertVariableResolve(resolver, 'REVERSE_RELATIVE_FILEPATH', undefined);
+		remoteModel.dispose();
 	});
 });
