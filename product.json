@@ -1,4 +1,7 @@
 {
+	"quality": "stable",
+	"updateUrl": "https://updates.rueschegg.integral-it.ch",
+	"downloadUrl": "https://github.com/DanielFabian/vscode/releases",
 	"nameShort": "Code - OSS",
 	"nameLong": "Code - OSS",
 	"applicationName": "code-oss",
