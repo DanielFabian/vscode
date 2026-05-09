@@ -1,0 +1,19 @@
+# Series for the Sovereign integration build.
+#
+# Each non-empty, non-comment line names a topic branch (typically
+# `topic/<short-name>`) that gets applied, in order, on top of the
+# upstream base ref (default `upstream/main`) to produce the
+# `sovereign/integration` ref.
+#
+# Adding a line ≈ merging a PR. Removing a line ≈ reverting one.
+# Reordering lines reorders application; topic branches *should* be
+# independent (commute) — if they don't, that's a signal to either
+# merge them into a single topic or split a diamond dependency out
+# as its own topic ahead of them in the series.
+#
+# `compose.sh --develop` also applies any `topic/*` branch not listed
+# here, ordered by first-commit date, on top of the integration. That
+# is the local-dev "see your in-flight work in context" view; CI never
+# uses it.
+
+topic/product-quality-update-url
