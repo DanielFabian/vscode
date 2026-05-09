@@ -552,10 +552,17 @@ class DefaultAccountProvider extends Disposable implements IDefaultAccountProvid
 				policyData.session_search = tokenEntitlementsData.policyData.session_search;
 				policyData.mcp = tokenEntitlementsData.policyData.mcp;
 				if (policyData.mcp) {
-					const mcpRegistryResult = await this.getMcpRegistryProvider(sessions, accountPolicyData, options);
-					mcpRegistryDataFetchedAt = mcpRegistryResult?.fetchedAt;
-					policyData.mcpRegistryUrl = mcpRegistryResult?.data?.url;
-					policyData.mcpAccess = mcpRegistryResult?.data?.registry_access;
+					if (options?.forceRefresh) {
+						const mcpRegistryResult = await this.getMcpRegistryProvider(sessions, accountPolicyData, options);
+						mcpRegistryDataFetchedAt = mcpRegistryResult?.fetchedAt;
+						policyData.mcpRegistryUrl = mcpRegistryResult?.data?.url;
+						policyData.mcpAccess = mcpRegistryResult?.data?.registry_access;
+					} else {
+						mcpRegistryDataFetchedAt = accountPolicyData?.mcpRegistryDataFetchedAt;
+						if (!accountPolicyData?.mcpRegistryDataFetchedAt || this.isDataStale(accountPolicyData.mcpRegistryDataFetchedAt)) {
+							void this.refreshMcpRegistryInBackground(sessions, accountId, accountPolicyData);
+						}
+					}
 				} else {
 					policyData.mcpRegistryUrl = undefined;
 					policyData.mcpAccess = undefined;
@@ -739,6 +746,30 @@ class DefaultAccountProvider extends Disposable implements IDefaultAccountProvid
 		return !isUndefined(data) ? { data, fetchedAt: Date.now() } : undefined;
 	}
 
+	private async refreshMcpRegistryInBackground(sessions: AuthenticationSession[], accountId: string, accountPolicyData: IAccountPolicyData | undefined): Promise<void> {
+		try {
+			const result = await this.getMcpRegistryProvider(sessions, accountPolicyData, { forceRefresh: true });
+			if (!result) {
+				return;
+			}
+			const currentPolicyData = this._policyData;
+			if (!currentPolicyData || currentPolicyData.accountId !== accountId) {
+				return; // account changed in the meantime
+			}
+			this.setPolicyData({
+				...currentPolicyData,
+				policyData: {
+					...currentPolicyData.policyData,
+					mcpRegistryUrl: result.data?.url,
+					mcpAccess: result.data?.registry_access,
+				},
+				mcpRegistryDataFetchedAt: result.fetchedAt,
+			});
+		} catch (error) {
+			this.logService.error('[DefaultAccount] Background MCP registry refresh failed:', getErrorMessage(error));
+		}
+	}
+
 	private async requestMcpRegistryProvider(sessions: AuthenticationSession[]): Promise<IMcpRegistryProvider | null | undefined> {
 		const mcpRegistryDataUrl = this.getMcpRegistryDataUrl();
 		if (!mcpRegistryDataUrl) {
@@ -747,7 +778,7 @@ class DefaultAccountProvider extends Disposable implements IDefaultAccountProvid
 		}
 
 		this.logService.debug('[DefaultAccount] Fetching MCP registry data from:', mcpRegistryDataUrl);
-		const response = await this.request(mcpRegistryDataUrl, 'GET', undefined, sessions, CancellationToken.None, 'defaultAccount.mcpRegistryProvider');
+		const response = await this.request(mcpRegistryDataUrl, 'GET', undefined, sessions, CancellationToken.None, 'defaultAccount.mcpRegistryProvider', { retryOn404: false });
 		if (!response) {
 			return undefined;
 		}
@@ -775,10 +806,11 @@ class DefaultAccountProvider extends Disposable implements IDefaultAccountProvid
 		}
 	}
 
-	private async request(url: string, type: 'GET', body: undefined, sessions: AuthenticationSession[], token: CancellationToken, callSite: string): Promise<IRequestContext | undefined>;
-	private async request(url: string, type: 'POST', body: object, sessions: AuthenticationSession[], token: CancellationToken, callSite: string): Promise<IRequestContext | undefined>;
-	private async request(url: string, type: 'GET' | 'POST', body: object | undefined, sessions: AuthenticationSession[], token: CancellationToken, callSite: string): Promise<IRequestContext | undefined> {
+	private async request(url: string, type: 'GET', body: undefined, sessions: AuthenticationSession[], token: CancellationToken, callSite: string, options?: { retryOn404?: boolean }): Promise<IRequestContext | undefined>;
+	private async request(url: string, type: 'POST', body: object, sessions: AuthenticationSession[], token: CancellationToken, callSite: string, options?: { retryOn404?: boolean }): Promise<IRequestContext | undefined>;
+	private async request(url: string, type: 'GET' | 'POST', body: object | undefined, sessions: AuthenticationSession[], token: CancellationToken, callSite: string, options?: { retryOn404?: boolean }): Promise<IRequestContext | undefined> {
 		let lastResponse: IRequestContext | undefined;
+		const retryOn404 = options?.retryOn404 !== false;
 
 		for (const session of sessions) {
 			if (token.isCancellationRequested) {
@@ -798,7 +830,7 @@ class DefaultAccountProvider extends Disposable implements IDefaultAccountProvid
 				}, token);
 
 				const status = response.res.statusCode;
-				if (status === 401 || status === 404) {
+				if (status === 401 || (status === 404 && retryOn404)) {
 					this.logService.debug(`[DefaultAccount] Received ${status} for URL ${url} with session ${session.id}, likely due to expired/revoked token or insufficient permissions.`, 'Trying next session if available.');
 					lastResponse = response;
 					continue; // try next session
