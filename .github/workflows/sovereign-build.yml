@@ -17,17 +17,28 @@ permissions:
   contents: read
 
 concurrency:
-  group: sovereign-build-linux-x64
+  group: sovereign-build-linux
   cancel-in-progress: false
 
 jobs:
-  linux-x64-archive:
+  linux-archive:
     if: github.repository != 'microsoft/vscode'
-    runs-on: ubuntu-24.04
+    name: linux-${{ matrix.vscode_arch }}-archive
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode_arch: x64
+            npm_arch: x64
+            runner: ubuntu-24.04
+          - vscode_arch: arm64
+            npm_arch: arm64
+            runner: ubuntu-24.04-arm
     env:
-      VSCODE_ARCH: x64
-      NPM_ARCH: x64
+      VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      NPM_ARCH: ${{ matrix.npm_arch }}
     steps:
       - name: Checkout Sovereign recipe branch
         uses: actions/checkout@v6
@@ -125,25 +136,25 @@ jobs:
             --repo .git/sovereign-compose \
             --version '${{ steps.version.outputs.release_version }}'
 
-      - name: Build Linux x64 archive tree
+      - name: Build Linux ${{ matrix.vscode_arch }} archive tree
         working-directory: .git/sovereign-compose
         run: |
           set -euo pipefail
 
-          npm run electron x64
-          npm run gulp vscode-linux-x64-min
+          npm run electron '${{ matrix.vscode_arch }}'
+          npm run gulp 'vscode-linux-${{ matrix.vscode_arch }}-min'
         env:
           VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
           npm_config_arch: ${{ env.NPM_ARCH }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Smoke test Linux x64 build
+      - name: Smoke test Linux ${{ matrix.vscode_arch }} build
         working-directory: .git/sovereign-compose
         timeout-minutes: 20
         run: |
           set -euo pipefail
 
-          build_dir="$GITHUB_WORKSPACE/.git/VSCode-linux-x64"
+          build_dir="$GITHUB_WORKSPACE/.git/VSCode-linux-${{ matrix.vscode_arch }}"
           if [[ ! -d "$build_dir" ]]; then
             echo "Expected build output directory missing: $build_dir" >&2
             exit 1
@@ -168,7 +179,7 @@ jobs:
           const path = require('path');
 
           (async () => {
-            const buildDir = path.join(process.env.GITHUB_WORKSPACE, '.git', 'VSCode-linux-x64');
+            const buildDir = path.join(process.env.GITHUB_WORKSPACE, '.git', 'VSCode-linux-${{ matrix.vscode_arch }}');
             const product = JSON.parse(fs.readFileSync(path.join(buildDir, 'resources', 'app', 'product.json'), 'utf8'));
             const gallery = product.extensionsGallery;
             if (!gallery?.serviceUrl) {
@@ -226,8 +237,8 @@ jobs:
           release_dir="$GITHUB_WORKSPACE/.build/sovereign-release"
           mkdir -p "$release_dir"
 
-          build_dir="$GITHUB_WORKSPACE/.git/VSCode-linux-x64"
-          artifact_name="code-oss-linux-x64-${{ steps.version.outputs.release_version }}.tar.gz"
+          build_dir="$GITHUB_WORKSPACE/.git/VSCode-linux-${{ matrix.vscode_arch }}"
+          artifact_name="code-oss-linux-${{ matrix.vscode_arch }}-${{ steps.version.outputs.release_version }}.tar.gz"
           artifact_path="$release_dir/$artifact_name"
 
           if [[ ! -d "$build_dir" ]]; then
@@ -253,7 +264,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sovereign-linux-x64-${{ steps.version.outputs.release_version }}
+          name: sovereign-linux-${{ matrix.vscode_arch }}-${{ steps.version.outputs.release_version }}
           path: .build/sovereign-release/*
           if-no-files-found: error
           retention-days: 7
