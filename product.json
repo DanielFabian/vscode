@@ -236,5 +236,14 @@
 	],
 	"builtInExtensionsEnabledWithAutoUpdates": [
 		"GitHub.copilot-chat"
-	]
+	],
+	"extensionsGallery": {
+		"serviceUrl": "https://marketplace.rueschegg.integral-it.ch/_apis/public/gallery",
+		"itemUrl": "https://marketplace.rueschegg.integral-it.ch/items",
+		"publisherUrl": "https://marketplace.rueschegg.integral-it.ch/publishers",
+		"resourceUrlTemplate": "https://marketplace.rueschegg.integral-it.ch/_gallery-resource/{publisher}/{name}/{version}/{path}",
+		"extensionUrlTemplate": "https://marketplace.rueschegg.integral-it.ch/_gallery/{publisher}/{name}/latest",
+		"controlUrl": "https://marketplace.rueschegg.integral-it.ch/extensions/marketplace.json",
+		"nlsBaseUrl": "https://marketplace.rueschegg.integral-it.ch/_lp/"
+	}
 }
