@@ -16,7 +16,7 @@ import { GitHubRepositoryModel } from '../../browser/models/githubRepositoryMode
 import { GitHubPRFetcher } from '../../browser/fetchers/githubPRFetcher.js';
 import { GitHubPRCIFetcher } from '../../browser/fetchers/githubPRCIFetcher.js';
 import { GitHubRepositoryFetcher } from '../../browser/fetchers/githubRepositoryFetcher.js';
-import { GitHubCIOverallStatus, GitHubCheckConclusion, GitHubCheckStatus, GitHubPullRequestState, IGitHubCICheck, IGitHubPRComment, IGitHubPullRequestReview, IGitHubPullRequest, IGitHubRepository, IGitHubPullRequestReviewThread } from '../../common/types.js';
+import { GitHubCIOverallStatus, GitHubCheckConclusion, GitHubCheckStatus, GitHubPullRequestState, IGitHubCICheck, IGitHubPRComment, IGitHubPullRequestReview, IGitHubPullRequest, IGitHubRepository, IGitHubPullRequestReviewThread, MergeBlockerKind } from '../../common/types.js';
 
 //#region Mock Fetchers
 
@@ -255,6 +255,81 @@ suite('GitHubPullRequestModel', () => {
 		});
 	});
 
+	test('refreshPullRequest refreshes only pull request metadata', async () => {
+		const model = store.add(new GitHubPullRequestModel('owner', 'repo', 1, mockFetcher as unknown as GitHubPRFetcher, logService));
+		mockFetcher.nextPR = makePR();
+
+		await model.refreshPullRequest();
+
+		assert.deepStrictEqual({
+			prNumber: model.pullRequest.get()?.number,
+			mergeability: model.mergeability.get(),
+			getPullRequestCalls: mockFetcher.getPullRequestCalls,
+			getReviewsCalls: mockFetcher.getReviewsCalls,
+		}, {
+			prNumber: 1,
+			mergeability: undefined,
+			getPullRequestCalls: 1,
+			getReviewsCalls: 0,
+		});
+	});
+
+	test('refreshPullRequest recomputes mergeability with cached reviews', async () => {
+		const model = store.add(new GitHubPullRequestModel('owner', 'repo', 1, mockFetcher as unknown as GitHubPRFetcher, logService));
+		mockFetcher.nextPR = makePR();
+		mockFetcher.nextReviews = [makeReview('APPROVED')];
+		await model.refresh();
+
+		mockFetcher.nextPR = { ...makePR(), isDraft: true };
+		await model.refreshPullRequest();
+
+		assert.deepStrictEqual({
+			canMerge: model.mergeability.get()?.canMerge,
+			blockers: model.mergeability.get()?.blockers.map(blocker => blocker.kind),
+			getPullRequestCalls: mockFetcher.getPullRequestCalls,
+			getReviewsCalls: mockFetcher.getReviewsCalls,
+		}, {
+			canMerge: false,
+			blockers: [MergeBlockerKind.Draft],
+			getPullRequestCalls: 2,
+			getReviewsCalls: 1,
+		});
+	});
+
+	test('refreshPullRequest shares an in-progress request', async () => {
+		const model = store.add(new GitHubPullRequestModel('owner', 'repo', 1, mockFetcher as unknown as GitHubPRFetcher, logService));
+		mockFetcher.nextPR = makePR();
+		mockFetcher.getPullRequestGate = new DeferredPromise<void>();
+
+		const firstRefresh = model.refreshPullRequest();
+		const secondRefresh = model.refreshPullRequest();
+
+		try {
+			assert.deepStrictEqual({
+				samePromise: firstRefresh === secondRefresh,
+				getPullRequestCalls: mockFetcher.getPullRequestCalls,
+				getReviewsCalls: mockFetcher.getReviewsCalls,
+			}, {
+				samePromise: true,
+				getPullRequestCalls: 1,
+				getReviewsCalls: 0,
+			});
+		} finally {
+			await mockFetcher.getPullRequestGate.complete(undefined);
+		}
+
+		await firstRefresh;
+		assert.deepStrictEqual({
+			prNumber: model.pullRequest.get()?.number,
+			getPullRequestCalls: mockFetcher.getPullRequestCalls,
+			getReviewsCalls: mockFetcher.getReviewsCalls,
+		}, {
+			prNumber: 1,
+			getPullRequestCalls: 1,
+			getReviewsCalls: 0,
+		});
+	});
+
 	test('postIssueComment calls fetcher', async () => {
 		const model = store.add(new GitHubPullRequestModel('owner', 'repo', 1, mockFetcher as unknown as GitHubPRFetcher, logService));
 
@@ -270,6 +345,24 @@ suite('GitHubPullRequestModel', () => {
 		polling.dispose();
 		polling.dispose();
 	});
+
+	test('pull request polling refreshes only pull request metadata', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const model = store.add(new GitHubPullRequestModel('owner', 'repo', 1, mockFetcher as unknown as GitHubPRFetcher, logService));
+		mockFetcher.nextPR = makePR();
+
+		const polling = model.startPullRequestPolling(10);
+
+		await timeout(10);
+		assert.deepStrictEqual({
+			getPullRequestCalls: mockFetcher.getPullRequestCalls,
+			getReviewsCalls: mockFetcher.getReviewsCalls,
+		}, {
+			getPullRequestCalls: 1,
+			getReviewsCalls: 0,
+		});
+
+		polling.dispose();
+	}));
 
 	test('polling stops when the last client stops polling', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		const model = store.add(new GitHubPullRequestModel('owner', 'repo', 1, mockFetcher as unknown as GitHubPRFetcher, logService));
@@ -704,6 +797,15 @@ function makePR(): IGitHubPullRequest {
 		mergedAt: undefined,
 		mergeable: true,
 		mergeableState: 'clean',
+	};
+}
+
+function makeReview(state: string): IGitHubPullRequestReview {
+	return {
+		id: 1,
+		author: { login: 'reviewer', avatarUrl: '' },
+		state,
+		submittedAt: '2024-01-02T00:00:00Z',
 	};
 }
 
