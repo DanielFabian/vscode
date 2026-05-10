@@ -7,6 +7,11 @@ on:
         description: Optional explicit Sovereign release version override
         required: false
         type: string
+      verify_marketplace:
+        description: Verify the configured Marketplace proxy is reachable from the runner
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -154,6 +159,7 @@ jobs:
           DISPLAY: ':10'
 
       - name: Verify Marketplace access
+        if: ${{ inputs.verify_marketplace }}
         run: |
           set -euo pipefail
 
