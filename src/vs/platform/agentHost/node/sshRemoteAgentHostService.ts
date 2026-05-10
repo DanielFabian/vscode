@@ -286,7 +286,9 @@ function createWebSocketRelay(
 					send: (data: string) => {
 						if (ws.readyState === ws.OPEN) {
 							ws.send(data);
+							return;
 						}
+						throw new Error(`${LOG_PREFIX} WebSocket relay is not open`);
 					},
 					close: () => ws.close(),
 				});
