@@ -556,6 +556,9 @@ struct ConnectionManager {
 	pub platform: Platform,
 	pub log: log::Logger,
 	args: ServeWebArgs,
+	/// Extension IDs for which to enable proposed API, forwarded from the
+	/// global `--enable-proposed-api` flag to the server subprocess.
+	enable_proposed_api: Vec<String>,
 	/// Server base path, ending in `/`
 	base_path: String,
 	/// Cache where servers are stored
@@ -612,6 +615,7 @@ impl ConnectionManager {
 		Arc::new(Self {
 			platform,
 			args,
+			enable_proposed_api: ctx.args.editor_options.enable_proposed_api.clone(),
 			base_path,
 			log: ctx.log.clone(),
 			cache,
@@ -744,6 +748,7 @@ impl ConnectionManager {
 		let state_map_dup = self.state.clone();
 		let args = StartArgs {
 			args: self.args.clone(),
+			enable_proposed_api: self.enable_proposed_api.clone(),
 			log: self.log.clone(),
 			opener,
 			release,
@@ -860,6 +865,9 @@ impl ConnectionManager {
 		if args.args.disable_telemetry {
 			cmd.arg("--disable-telemetry");
 		}
+		for ext_id in &args.enable_proposed_api {
+			cmd.arg(format!("--enable-proposed-api={ext_id}"));
+		}
 
 		// removed, otherwise the workbench will not be usable when running the CLI from sources.
 		cmd.env_remove("VSCODE_DEV");
@@ -928,6 +936,7 @@ impl ConnectionManager {
 struct StartArgs {
 	log: log::Logger,
 	args: ServeWebArgs,
+	enable_proposed_api: Vec<String>,
 	release: Release,
 	opener: BarrierOpener<Result<StartData, String>>,
 }
