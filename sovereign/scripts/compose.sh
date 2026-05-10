@@ -69,6 +69,21 @@ FAILURE_ENV="$WORKTREE_DIR/compose-failure.env"
 TARGET_REF="$INT_REF"
 [[ "$DEVELOP" -eq 1 ]] && TARGET_REF="$DEV_REF"
 
+# The standalone Sovereign repository intentionally does not mirror upstream
+# Git LFS blobs such as Copilot simulation SQLite caches. Composition and
+# release builds only need Git pointer files for those test assets, so all
+# worktree-updating Git operations below must avoid LFS smudging.
+export GIT_LFS_SKIP_SMUDGE=1
+GIT_NO_LFS_CONFIG=(
+	-c filter.lfs.smudge=
+	-c filter.lfs.process=
+	-c filter.lfs.required=false
+)
+
+git_no_lfs() {
+	git "${GIT_NO_LFS_CONFIG[@]}" "$@"
+}
+
 topic_suffix() {
 	local topic="$1"
 	case "$topic" in
@@ -174,7 +189,7 @@ ALL_TOPICS=("${SERIES[@]}" "${DEVELOP_TOPICS[@]}")
 
 # Prepare the compose worktree.
 if [[ ! -d "$WORKTREE_DIR" ]]; then
-	git worktree add --detach -f "$WORKTREE_DIR" "$BASE" >/dev/null
+	git_no_lfs worktree add --detach -f "$WORKTREE_DIR" "$BASE" >/dev/null
 fi
 
 (
@@ -186,8 +201,8 @@ fi
 	# CRITICAL: the worktree must be detached before reset/clean,
 	# otherwise reset would clobber whatever branch HEAD pointed at.
 	# A previous run might have left HEAD attached to a topic branch.
-	git checkout --detach >/dev/null 2>&1 || true
-	git reset --hard "$BASE" >/dev/null
+	git_no_lfs checkout --detach >/dev/null 2>&1 || true
+	git_no_lfs reset --hard "$BASE" >/dev/null
 	git clean -fdx >/dev/null
 )
 rm -f "$FAILURE_ENV"
@@ -246,7 +261,7 @@ for t in "${ALL_TOPICS[@]}"; do
 	echo "compose: applying $topic_base_name..$t"
 	if ! (
 		cd "$WORKTREE_DIR"
-		git cherry-pick "$topic_base_sha..$topic_tip_sha"
+		git_no_lfs cherry-pick "$topic_base_sha..$topic_tip_sha"
 	); then
 		write_failure_state "$t" "$suffix" "cherry-pick" "Cherry-pick failed while applying '$topic_base_name..$t'." "$repair_sha" "$topic_base_name" "$topic_base_sha" "$topic_tip_sha"
 		failed_topic="$t"
