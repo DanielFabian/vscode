@@ -1,0 +1,165 @@
+name: Sovereign Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Optional explicit Sovereign release version override
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sovereign-build-linux-x64
+  cancel-in-progress: false
+
+jobs:
+  linux-x64-archive:
+    if: github.repository != 'microsoft/vscode'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      VSCODE_ARCH: x64
+      NPM_ARCH: x64
+    steps:
+      - name: Checkout Sovereign recipe branch
+        uses: actions/checkout@v6
+        with:
+          ref: sovereign/main
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+
+      - name: Setup build dependencies
+        run: |
+          set -euo pipefail
+
+          ./build/azure-pipelines/linux/apt-retry.sh sudo apt-get update
+          ./build/azure-pipelines/linux/apt-retry.sh sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-0 \
+            libxkbfile-dev \
+            libkrb5-dev \
+            libgbm1 \
+            fakeroot \
+            rpm
+
+      - name: Fetch release inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+
+          upstream_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
+          if [[ -z "$upstream_base" ]]; then
+            echo 'sovereign/upstream-base is empty' >&2
+            exit 1
+          fi
+
+          upstream_url='https://github.com/microsoft/vscode.git'
+          git fetch --depth=1 "$upstream_url" "refs/tags/$upstream_base:refs/tags/$upstream_base"
+          git fetch --depth=100 --prune origin \
+            '+refs/heads/topic/*:refs/heads/topic/*' \
+            '+refs/heads/topic-base/*:refs/heads/topic-base/*'
+
+          echo "upstream_base=$upstream_base" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Git committer
+        run: |
+          git config user.name 'Sovereign CI'
+          git config user.email 'sovereign-ci@users.noreply.github.com'
+
+      - name: Compose patch stack
+        run: sovereign/scripts/compose.sh --base '${{ steps.inputs.outputs.upstream_base }}'
+
+      - name: Compute release version
+        id: version
+        run: |
+          set -euo pipefail
+
+          mkdir -p .build/sovereign-release
+          args=(
+            --upstream-base '${{ steps.inputs.outputs.upstream_base }}'
+            --remote origin
+            --github-output "$GITHUB_OUTPUT"
+            --json .build/sovereign-release/release-version.json
+          )
+          override='${{ inputs.release_version }}'
+          if [[ -n "$override" ]]; then
+            args+=(--override "$override")
+          fi
+
+          node sovereign/scripts/compute-release-version.mjs "${args[@]}"
+
+      - name: Install dependencies
+        working-directory: .git/sovereign-compose
+        run: |
+          set -euo pipefail
+
+          npm ci
+        env:
+          npm_config_arch: ${{ env.NPM_ARCH }}
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply build-time release version
+        run: |
+          node sovereign/scripts/apply-release-version.mjs \
+            --repo .git/sovereign-compose \
+            --version '${{ steps.version.outputs.release_version }}'
+
+      - name: Build Linux x64 archive tree
+        working-directory: .git/sovereign-compose
+        run: |
+          set -euo pipefail
+
+          npm run electron x64
+          npm run gulp vscode-linux-x64-min
+        env:
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+          npm_config_arch: ${{ env.NPM_ARCH }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package artifact and provenance
+        id: artifact
+        run: |
+          set -euo pipefail
+
+          release_dir="$GITHUB_WORKSPACE/.build/sovereign-release"
+          mkdir -p "$release_dir"
+
+          build_dir="$GITHUB_WORKSPACE/.git/VSCode-linux-x64"
+          artifact_name="code-oss-linux-x64-${{ steps.version.outputs.release_version }}.tar.gz"
+          artifact_path="$release_dir/$artifact_name"
+
+          if [[ ! -d "$build_dir" ]]; then
+            echo "Expected build output directory missing: $build_dir" >&2
+            exit 1
+          fi
+
+          tar -C "$(dirname "$build_dir")" -czf "$artifact_path" "$(basename "$build_dir")"
+          sha256="$(sha256sum "$artifact_path" | awk '{ print $1 }')"
+          printf '%s  %s\n' "$sha256" "$artifact_name" > "$artifact_path.sha256"
+
+          node sovereign/scripts/write-release-provenance.mjs \
+            --repo .git/sovereign-compose \
+            --release-version '${{ steps.version.outputs.release_version }}' \
+            --upstream-base '${{ steps.inputs.outputs.upstream_base }}' \
+            --artifact "$artifact_path" \
+            --sha256 "$sha256" \
+            --output "$release_dir/sovereign-provenance.json"
+
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sovereign-linux-x64-${{ steps.version.outputs.release_version }}
+          path: .build/sovereign-release/*
+          if-no-files-found: error
+          retention-days: 7
