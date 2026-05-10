@@ -2026,6 +2026,7 @@ export interface SCMProviderFeatures {
 	actionButton?: SCMActionButtonDto | null;
 	statusBarCommands?: ICommandDto[];
 	contextValue?: string;
+	branchName?: string;
 }
 
 export interface SCMActionButtonDto {
