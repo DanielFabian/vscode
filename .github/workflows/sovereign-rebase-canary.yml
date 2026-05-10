@@ -119,6 +119,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Delete stale repair bases
+        if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code == '0'
+        run: |
+          set -euo pipefail
+
+          awk '
+            { sub(/#.*/, "") }
+            /[^[:space:]]/ { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }
+          ' sovereign/series | while IFS= read -r topic; do
+            suffix="${topic#topic/}"
+            git push origin --delete "topic-repair-base/$suffix" 2>/dev/null || true
+          done
+
       - name: Fail canary on compose failure
         if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code != '0'
         run: |
