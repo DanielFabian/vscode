@@ -136,6 +136,15 @@ export default tseslint.config(
 			]
 		},
 	},
+	// Sovereign helper scripts are fork-owned and intentionally do not carry the Microsoft copyright header.
+	{
+		files: [
+			'sovereign/scripts/**/*.mjs',
+		],
+		rules: {
+			'header/header': 'off',
+		},
+	},
 	// TS
 	{
 		files: [

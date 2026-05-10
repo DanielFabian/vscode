@@ -1,4 +1,3 @@
-// eslint-disable-next-line header/header
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
