@@ -651,6 +651,16 @@ export class ChatListItemRenderer extends Disposable implements ITreeRenderer<Ch
 		this._elementBeingRendered = node.element;
 		try {
 			this.renderChatTreeItem(node.element, index, templateData);
+
+			// Seed `currentRenderedHeight` from the row's mounted box now, while
+			// `_elementBeingRendered` is still set so `fireItemHeightChange`
+			// won't dispatch (it can't safely re-enter the in-flight tree splice).
+			// The ResizeObserver's first post-mount delivery will then hit the
+			// same-height guard and return without firing, avoiding
+			// `ResizeObserver loop completed with undelivered notifications`
+			// caused by the downstream `updateLastItemMinHeight` chain resizing
+			// a sibling row inside the observer callback.
+			this.fireItemHeightChange(templateData);
 		} finally {
 			this._elementBeingRendered = undefined;
 		}
