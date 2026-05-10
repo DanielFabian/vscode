@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: sovereign/main
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Mirror semver upstream tags
         run: |

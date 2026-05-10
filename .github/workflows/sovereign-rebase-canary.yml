@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: sovereign/main
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Determine target tag
         id: target
@@ -74,8 +74,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          git fetch --prune origin \
-            '+refs/tags/*:refs/tags/*' \
+          upstream_url='https://github.com/microsoft/vscode.git'
+          git fetch --depth=1 "$upstream_url" \
+            'refs/tags/${{ steps.target.outputs.target_tag }}:refs/tags/${{ steps.target.outputs.target_tag }}'
+
+          git fetch --depth=1000 --prune origin \
             '+refs/heads/topic/*:refs/heads/topic/*' \
             '+refs/heads/topic-base/*:refs/heads/topic-base/*' \
             '+refs/heads/topic-repair-base/*:refs/heads/topic-repair-base/*'
