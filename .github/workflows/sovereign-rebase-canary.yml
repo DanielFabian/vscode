@@ -18,7 +18,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: sovereign-rebase-canary
+  group: sovereign-rebase-canary-active
   cancel-in-progress: true
 
 jobs:
