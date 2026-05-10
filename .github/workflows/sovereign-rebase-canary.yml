@@ -83,6 +83,12 @@ jobs:
             '+refs/heads/topic-base/*:refs/heads/topic-base/*' \
             '+refs/heads/topic-repair-base/*:refs/heads/topic-repair-base/*'
 
+      - name: Configure Git committer
+        if: steps.target.outputs.should_run == 'true'
+        run: |
+          git config user.name 'Sovereign CI'
+          git config user.email 'sovereign-ci@users.noreply.github.com'
+
       - name: Compose patch stack
         if: steps.target.outputs.should_run == 'true'
         id: compose
@@ -101,12 +107,14 @@ jobs:
 
       - name: Report canary failure
         if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code != '0'
+        continue-on-error: true
         run: sovereign/scripts/report-canary.sh failure .git/sovereign-compose/compose-failure.env '${{ steps.target.outputs.target_tag }}'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Report canary success
         if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code == '0'
+        continue-on-error: true
         run: sovereign/scripts/report-canary.sh success '${{ steps.target.outputs.target_tag }}'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
