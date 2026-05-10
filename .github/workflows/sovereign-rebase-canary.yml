@@ -78,7 +78,7 @@ jobs:
           git fetch --depth=1 "$upstream_url" \
             'refs/tags/${{ steps.target.outputs.target_tag }}:refs/tags/${{ steps.target.outputs.target_tag }}'
 
-          git fetch --depth=1000 --prune origin \
+          git fetch --depth=100 --prune origin \
             '+refs/heads/topic/*:refs/heads/topic/*' \
             '+refs/heads/topic-base/*:refs/heads/topic-base/*' \
             '+refs/heads/topic-repair-base/*:refs/heads/topic-repair-base/*'
