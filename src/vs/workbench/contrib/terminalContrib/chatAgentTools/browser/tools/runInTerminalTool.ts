@@ -77,6 +77,7 @@ import { clamp } from '../../../../../../base/common/numbers.js';
 import { IOutputAnalyzer } from './outputAnalyzer.js';
 import { SandboxOutputAnalyzer, outputLooksSandboxBlocked } from './sandboxOutputAnalyzer.js';
 import { IAgentSessionsService } from '../../../../chat/browser/agentSessions/agentSessionsService.js';
+import { IAgentHostSessionWorkingDirectoryResolver } from '../../../../chat/browser/agentSessions/agentHost/agentHostSessionWorkingDirectoryResolver.js';
 import { ITerminalSandboxService, TerminalSandboxPrerequisiteCheck, type ITerminalSandboxResolvedNetworkDomains } from '../../common/terminalSandboxService.js';
 import { LanguageModelPartAudience } from '../../../../chat/common/languageModels.js';
 import { isSessionAutoApproveLevel, isTerminalAutoApproveAllowed, isToolEligibleForTerminalAutoApproval } from './terminalToolAutoApprove.js';
@@ -570,6 +571,7 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
 		@IChatWidgetService private readonly _chatWidgetService: IChatWidgetService,
 		@IAgentSessionsService private readonly _agentSessionsService: IAgentSessionsService,
+		@IAgentHostSessionWorkingDirectoryResolver private readonly _workingDirectoryResolver: IAgentHostSessionWorkingDirectoryResolver,
 	) {
 		super();
 
@@ -662,6 +664,12 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 			this._osBackend,
 			this._profileFetcher.getCopilotShell(),
 			(async () => {
+				if (chatSessionResource) {
+					const sessionCwd = this._workingDirectoryResolver.getSessionWorkingDirectory(chatSessionResource);
+					if (sessionCwd) {
+						return sessionCwd;
+					}
+				}
 				let cwd = await instance?.getCwdResource();
 				if (!cwd) {
 					// Prefer the session's working directory (agents window) over the
@@ -1326,7 +1334,7 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 		// Subagent-initiated terminals cannot receive steering messages; the subagent
 		// runs in its own tool-calling loop and should poll with get_terminal_output.
 		const shouldSendNotifications = !invocation.subAgentInvocationId;
-		const command = toolSpecificData.commandLine.userEdited ?? toolSpecificData.commandLine.toolEdited ?? toolSpecificData.commandLine.original;
+		let command = toolSpecificData.commandLine.userEdited ?? toolSpecificData.commandLine.toolEdited ?? toolSpecificData.commandLine.original;
 		const didUserEditCommand = (
 			toolSpecificData.commandLine.userEdited !== undefined &&
 			toolSpecificData.commandLine.userEdited !== toolSpecificData.commandLine.original
@@ -1343,6 +1351,19 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 
 		const didSandboxWrapCommand = toolSpecificData.commandLine.isSandboxWrapped === true;
 		const isSandboxEnabled = await this._terminalSandboxService.isEnabled();
+		// Prepend a cd command to ensure the terminal runs in the resolved CWD.
+		// This works both with and without sandbox wrapping: the outer cd sets
+		// the shell's working directory before launching the sandbox runtime,
+		// which inherits it.
+		if (toolSpecificData.cwd) {
+			const cwdPath = URI.revive(toolSpecificData.cwd).fsPath;
+			const os = await this._osBackend;
+			if (os === OperatingSystem.Windows) {
+				command = `cd /d "${cwdPath}" && ${command}`;
+			} else {
+				command = `cd "${cwdPath}" && ${command}`;
+			}
+		}
 		const commandLineForMetadata = isSandboxEnabled
 			? toolSpecificData.commandLine.forDisplay ?? toolSpecificData.commandLine.original
 			: undefined;
