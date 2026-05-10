@@ -153,6 +153,65 @@ jobs:
         env:
           DISPLAY: ':10'
 
+      - name: Verify Marketplace access
+        run: |
+          set -euo pipefail
+
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          (async () => {
+            const buildDir = path.join(process.env.GITHUB_WORKSPACE, '.git', 'VSCode-linux-x64');
+            const product = JSON.parse(fs.readFileSync(path.join(buildDir, 'resources', 'app', 'product.json'), 'utf8'));
+            const gallery = product.extensionsGallery;
+            if (!gallery?.serviceUrl) {
+              throw new Error('Packaged product is missing extensionsGallery.serviceUrl');
+            }
+
+            const body = JSON.stringify({
+              filters: [{
+                criteria: [
+                  { filterType: 7, value: 'ms-python.python' },
+                  { filterType: 8, value: 'Microsoft.VisualStudio.Code' },
+                ],
+                pageNumber: 1,
+                pageSize: 1,
+                sortBy: 0,
+                sortOrder: 0,
+              }],
+              assetTypes: [],
+              flags: 0x20 | 0x80 | 0x200,
+            });
+
+            const response = await fetch(`${gallery.serviceUrl}/extensionquery`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json;api-version=3.0-preview.1',
+                'Content-Length': String(Buffer.byteLength(body)),
+              },
+              body,
+            });
+
+            if (!response.ok) {
+              throw new Error(`Marketplace query failed: HTTP ${response.status}`);
+            }
+
+            const result = await response.json();
+            const extension = result?.results?.[0]?.extensions?.[0];
+            const extensionId = extension && `${extension.publisher.publisherName}.${extension.extensionName}`;
+            if (extensionId !== 'ms-python.python') {
+              throw new Error(`Marketplace query returned unexpected extension: ${extensionId ?? '<none>'}`);
+            }
+
+            console.log(`Marketplace query succeeded: ${extensionId}`);
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
       - name: Package artifact and provenance
         id: artifact
         run: |
