@@ -6,6 +6,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import { ConfigKey, IConfigurationService } from '../../../../platform/configuration/common/configurationService';
 import { MockEndpoint } from '../../../../platform/endpoint/test/node/mockEndpoint';
+import { CUSTOM_TOOL_SEARCH_NAME } from '../../../../platform/networking/common/anthropic';
 import { IChatEndpoint } from '../../../../platform/networking/common/networking';
 import { IExperimentationService } from '../../../../platform/telemetry/common/nullExperimentationService';
 import { ITestingServicesAccessor } from '../../../../platform/test/node/services';
@@ -102,6 +103,21 @@ describe('getAgentTools background todo enablement', () => {
 		return tools.some(t => t.name === ToolName.CoreManageTodoList);
 	}
 
+	function hasTool(tools: readonly { name: string }[], name: string): boolean {
+		return tools.some(tool => tool.name === name);
+	}
+
+	function createToolSearchEndpoint(model: string, modelProvider = 'openai', supportsToolSearch = true): IChatEndpoint {
+		return {
+			...mockEndpoint,
+			model,
+			family: model,
+			modelProvider,
+			// Pin endpoint capability so this test isolates getAgentTools gating from endpoint capability derivation.
+			supportsToolSearch,
+		} as IChatEndpoint;
+	}
+
 	test('background todo agent is enabled only when experiment is on and todo is not explicit', () => {
 		const request = new TestChatRequest('fix the bug');
 		configService.setConfig(ConfigKey.Advanced.BackgroundTodoAgentEnabled, false);
@@ -136,5 +152,21 @@ describe('getAgentTools background todo enablement', () => {
 		(request as any).toolReferences = [{ name: 'read_file' }];
 		const tools = await instantiationService.invokeFunction(getAgentTools, request, mockEndpoint);
 		expect(hasTodoTool(tools)).toBe(false);
+	});
+
+	test('supported Custom OAI Responses gpt-5.4 and gpt-5.5 endpoints surface tool_search when endpoint capability is enabled', async () => {
+		const request = new TestChatRequest('find the right tool');
+		for (const model of ['gpt-5.4', 'gpt-5.5']) {
+			const tools = await instantiationService.invokeFunction(getAgentTools, request, createToolSearchEndpoint(model, 'CustomOAI'));
+			expect(hasTool(tools, CUSTOM_TOOL_SEARCH_NAME)).toBe(true);
+		}
+	});
+
+	test('supported Custom OAI Responses endpoints omit tool_search when endpoint capability is disabled', async () => {
+		const request = new TestChatRequest('find the right tool');
+		for (const model of ['gpt-5.4', 'gpt-5.5']) {
+			const tools = await instantiationService.invokeFunction(getAgentTools, request, createToolSearchEndpoint(model, 'CustomOAI', false));
+			expect(hasTool(tools, CUSTOM_TOOL_SEARCH_NAME)).toBe(false);
+		}
 	});
 });

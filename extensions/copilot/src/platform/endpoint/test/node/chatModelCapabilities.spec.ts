@@ -34,6 +34,14 @@ describe('modelSupportsPDFDocuments', () => {
 });
 
 describe('modelSupportsToolSearch', () => {
+	const experimentationService = {} as IExperimentationService;
+
+	function createToolSearchConfigurationService(enabled: boolean): IConfigurationService {
+		return {
+			getExperimentBasedConfig: (key: unknown) => key === ConfigKey.ResponsesApiToolSearchEnabled && enabled,
+		} as unknown as IConfigurationService;
+	}
+
 	test('supports Claude Sonnet/Opus 4.5 and up', () => {
 		expect(modelSupportsToolSearch('claude-sonnet-4-5')).toBe(true);
 		expect(modelSupportsToolSearch('claude-sonnet-4.5')).toBe(true);
@@ -66,28 +74,29 @@ describe('modelSupportsToolSearch', () => {
 		expect(modelSupportsToolSearch('claude-3-opus')).toBe(false);
 	});
 
-	test('supports OpenAI gpt-5.4 and gpt-5.5 models when the setting is enabled', () => {
-		const configurationService = {
-			getExperimentBasedConfig: (key: unknown) => key === ConfigKey.ResponsesApiToolSearchEnabled,
-		} as unknown as IConfigurationService;
-		const experimentationService = {} as IExperimentationService;
+	test('supports exact gpt-5.4 and gpt-5.5 models when the feature flag is enabled', () => {
+		const configurationService = createToolSearchConfigurationService(true);
 
-		expect(modelSupportsToolSearch('gpt-5.4', configurationService, experimentationService)).toBe(true);
-		expect(modelSupportsToolSearch('gpt-5.5', configurationService, experimentationService)).toBe(true);
-		expect(modelSupportsToolSearch('gpt-5.4')).toBe(false);
-		expect(modelSupportsToolSearch('gpt-5.5')).toBe(false);
+		for (const model of ['gpt-5.4', 'gpt-5.5']) {
+			expect(modelSupportsToolSearch(model, configurationService, experimentationService)).toBe(true);
+		}
+	});
+
+	test('rejects exact gpt-5.4 and gpt-5.5 models when the feature flag is disabled', () => {
+		const configurationService = createToolSearchConfigurationService(false);
+
+		for (const model of ['gpt-5.4', 'gpt-5.5']) {
+			expect(modelSupportsToolSearch(model, configurationService, experimentationService)).toBe(false);
+		}
 	});
 
 	test('rejects suffixed gpt-5.4/5.5 variants (exact match only)', () => {
-		const configurationService = {
-			getExperimentBasedConfig: (key: unknown) => key === ConfigKey.ResponsesApiToolSearchEnabled,
-		} as unknown as IConfigurationService;
-		const experimentationService = {} as IExperimentationService;
+		const configurationService = createToolSearchConfigurationService(true);
 
 		expect(modelSupportsToolSearch('gpt-5.4-mini', configurationService, experimentationService)).toBe(false);
 		expect(modelSupportsToolSearch('gpt-5.4-preview', configurationService, experimentationService)).toBe(false);
+		expect(modelSupportsToolSearch('gpt-5.5-mini', configurationService, experimentationService)).toBe(false);
 		expect(modelSupportsToolSearch('gpt-5.5-preview', configurationService, experimentationService)).toBe(false);
-		expect(modelSupportsToolSearch('gpt5.5-preview', configurationService, experimentationService)).toBe(false);
 	});
 
 	test('rejects other non-Claude models', () => {
