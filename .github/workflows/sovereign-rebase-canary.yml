@@ -54,6 +54,13 @@ jobs:
             exit 0
           fi
 
+          target_patch="${target_tag##*.}"
+          if (( target_patch >= 10000 )); then
+            echo "Ignoring Sovereign release tag '$target_tag'; canary only tests upstream tags."
+            echo 'should_run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           current_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
           highest="$(printf '%s\n%s\n' "$current_base" "$target_tag" | sort -V | tail -n1)"
           if [[ "$require_newer" == 'true' && ( "$target_tag" == "$current_base" || "$highest" != "$target_tag" ) ]]; then

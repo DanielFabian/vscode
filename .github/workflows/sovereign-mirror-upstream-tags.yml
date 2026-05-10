@@ -47,6 +47,13 @@ jobs:
             [[ "$1" != "$2" ]] && version_ge "$1" "$2"
           }
 
+          is_upstream_release_tag() {
+            local tag="$1"
+            [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+            local patch="${tag##*.}"
+            (( patch < 10000 ))
+          }
+
           mapfile -t upstream_tags < <(
             git ls-remote --tags --refs "$upstream_url" \
               | awk '{ sub("refs/tags/", "", $2); print $2 }' \
@@ -56,6 +63,10 @@ jobs:
 
           mirrored=0
           for tag in "${upstream_tags[@]}"; do
+            if ! is_upstream_release_tag "$tag"; then
+              continue
+            fi
+
             if ! version_ge "$tag" "$current_base"; then
               continue
             fi
