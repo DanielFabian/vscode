@@ -1,0 +1,80 @@
+name: Sovereign Mirror Upstream Tags
+
+on:
+  push:
+    branches:
+      - sovereign/main
+    paths:
+      - .github/workflows/sovereign-mirror-upstream-tags.yml
+      - sovereign/upstream-base
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: sovereign-mirror-upstream-tags
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository != 'microsoft/vscode'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Sovereign recipe branch
+        uses: actions/checkout@v6
+        with:
+          ref: sovereign/main
+          fetch-depth: 0
+
+      - name: Mirror semver upstream tags
+        run: |
+          set -euo pipefail
+
+          upstream_url='https://github.com/microsoft/vscode.git'
+          current_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
+
+          version_ge() {
+            local lhs="$1"
+            local rhs="$2"
+            [[ "$(printf '%s\n%s\n' "$lhs" "$rhs" | sort -V | tail -n1)" == "$lhs" ]]
+          }
+
+          version_gt() {
+            [[ "$1" != "$2" ]] && version_ge "$1" "$2"
+          }
+
+          mapfile -t upstream_tags < <(
+            git ls-remote --tags --refs "$upstream_url" \
+              | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V
+          )
+
+          mirrored=0
+          for tag in "${upstream_tags[@]}"; do
+            if ! version_ge "$tag" "$current_base"; then
+              continue
+            fi
+
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              continue
+            fi
+
+            echo "Mirroring upstream tag $tag"
+            git fetch --depth=1 "$upstream_url" "refs/tags/$tag:refs/tags/$tag"
+            git push origin "refs/tags/$tag"
+            mirrored=$((mirrored + 1))
+
+            if version_gt "$tag" "$current_base"; then
+              echo "Dispatching Sovereign canary for $tag"
+              gh workflow run sovereign-rebase-canary.yml --ref sovereign/main -f "target_tag=$tag"
+            fi
+          done
+
+          echo "Mirrored $mirrored new tag(s)."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

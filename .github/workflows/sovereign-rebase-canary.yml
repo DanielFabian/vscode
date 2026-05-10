@@ -1,0 +1,115 @@
+name: Sovereign Rebase Canary
+
+on:
+  push:
+    branches:
+      - sovereign/main
+    tags:
+      - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: Upstream semver tag to test against
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sovereign-rebase-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    if: github.repository != 'microsoft/vscode'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Sovereign recipe branch
+        uses: actions/checkout@v6
+        with:
+          ref: sovereign/main
+          fetch-depth: 0
+
+      - name: Determine target tag
+        id: target
+        run: |
+          set -euo pipefail
+
+          if [[ '${{ github.event_name }}' == 'workflow_dispatch' ]]; then
+            target_tag='${{ inputs.target_tag }}'
+            require_newer=true
+          elif [[ '${{ github.ref_type }}' == 'tag' ]]; then
+            target_tag='${{ github.ref_name }}'
+            require_newer=true
+          else
+            target_tag="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
+            require_newer=false
+          fi
+
+          if [[ ! "$target_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Ignoring non-semver tag '$target_tag'."
+            echo 'should_run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          current_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
+          highest="$(printf '%s\n%s\n' "$current_base" "$target_tag" | sort -V | tail -n1)"
+          if [[ "$require_newer" == 'true' && ( "$target_tag" == "$current_base" || "$highest" != "$target_tag" ) ]]; then
+            echo "Tag '$target_tag' is not newer than upstream-base '$current_base'; skipping canary."
+            echo 'should_run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Testing Sovereign patch stack on $target_tag (current upstream-base: $current_base)."
+          {
+            echo 'should_run=true'
+            echo "target_tag=$target_tag"
+            echo "current_base=$current_base"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Sovereign refs
+        if: steps.target.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+
+          git fetch --prune origin \
+            '+refs/tags/*:refs/tags/*' \
+            '+refs/heads/topic/*:refs/heads/topic/*' \
+            '+refs/heads/topic-base/*:refs/heads/topic-base/*' \
+            '+refs/heads/topic-repair-base/*:refs/heads/topic-repair-base/*'
+
+      - name: Compose patch stack
+        if: steps.target.outputs.should_run == 'true'
+        id: compose
+        run: |
+          set +e
+          sovereign/scripts/compose.sh --base '${{ steps.target.outputs.target_tag }}'
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Push repair base
+        if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code != '0'
+        run: |
+          set -euo pipefail
+          git push origin 'refs/heads/topic-repair-base/*:refs/heads/topic-repair-base/*'
+
+      - name: Report canary failure
+        if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code != '0'
+        run: sovereign/scripts/report-canary.sh failure .git/sovereign-compose/compose-failure.env '${{ steps.target.outputs.target_tag }}'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report canary success
+        if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code == '0'
+        run: sovereign/scripts/report-canary.sh success '${{ steps.target.outputs.target_tag }}'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail canary on compose failure
+        if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code != '0'
+        run: |
+          exit_code='${{ steps.compose.outputs.exit_code }}'
+          exit "$exit_code"

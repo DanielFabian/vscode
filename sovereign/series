@@ -1,15 +1,21 @@
 # Series for the Sovereign integration build.
 #
-# Each non-empty, non-comment line names a topic branch (typically
-# `topic/<short-name>`) that gets applied, in order, on top of the
-# upstream base ref (default `upstream/main`) to produce the
-# `sovereign/integration` ref.
+# Each non-empty, non-comment line names a topic branch, typically
+# `topic/<short-name>`. For every listed topic there must also be a
+# corresponding `topic-base/<short-name>` branch. The range
+# `topic-base/<short-name>..topic/<short-name>` is the topic's patch;
+# `compose.sh` applies those ranges, in this order, on top of the
+# upstream base named in `sovereign/upstream-base` to produce the
+# derived `sovereign/integration` ref.
 #
 # Adding a line ≈ merging a PR. Removing a line ≈ reverting one.
 # Reordering lines reorders application; topic branches *should* be
-# independent (commute) — if they don't, that's a signal to either
-# merge them into a single topic or split a diamond dependency out
-# as its own topic ahead of them in the series.
+# usually independent (commute), but the order is semantically real:
+# a later topic may depend on effects introduced by earlier topics.
+# When a topic no longer applies cleanly, the canary writes
+# `topic-repair-base/<short-name>` at the freshly composed prefix to
+# rebase that one topic onto; `topic-base/<short-name>` moves only
+# after that topic has been successfully rewritten.
 #
 # `compose.sh --develop` also applies any `topic/*` branch not listed
 # here, ordered by first-commit date, on top of the integration. That
