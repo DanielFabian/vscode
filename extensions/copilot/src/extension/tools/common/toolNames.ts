@@ -265,7 +265,7 @@ export const toolCategories: Record<ToolName, ToolCategory> = {
 	[ToolName.CoreTerminalConfirmationTool]: ToolCategory.VSCodeInteraction,
 	[ToolName.CoreAskQuestions]: ToolCategory.VSCodeInteraction,
 	[ToolName.SwitchAgent]: ToolCategory.VSCodeInteraction,
-	[ToolName.Memory]: ToolCategory.VSCodeInteraction,
+	[ToolName.Memory]: ToolCategory.Core,
 	[ToolName.ToolSearch]: ToolCategory.Core,
 	[ToolName.ResolveMemoryFileUri]: ToolCategory.Core,
 	[ToolName.Skill]: ToolCategory.Core,
