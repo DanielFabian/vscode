@@ -3,6 +3,10 @@
 [![Bugs](https://img.shields.io/github/issues/microsoft/vscode/bug.svg)](https://github.com/microsoft/vscode/issues?utf8=✓&q=is%3Aissue+is%3Aopen+label%3Abug)
 [![Gitter](https://img.shields.io/badge/chat-on%20gitter-yellow.svg)](https://gitter.im/Microsoft/vscode)
 
+## Sovereign Fork Notes
+
+This branch is maintained as a Sovereign patch stack on top of upstream VS Code. Before contributing source, product, workflow, or release changes to this fork, read [Sovereign Patch-Stack Discipline](sovereign/README.md). In particular, source changes that should appear in the built editor belong in `topic/*` branches, while `sovereign/main` is the recipe branch.
+
 ## The Repository
 
 This repository ("`Code - OSS`") is where we (Microsoft) develop the [Visual Studio Code](https://code.visualstudio.com) product together with the community. Not only do we work on code and issues here, but we also publish our [roadmap](https://github.com/microsoft/vscode/wiki/Roadmap), [monthly iteration plans](https://github.com/microsoft/vscode/wiki/Iteration-Plans), and our [endgame plans](https://github.com/microsoft/vscode/wiki/Running-the-Endgame). This source code is available to everyone under the standard [MIT license](https://github.com/microsoft/vscode/blob/main/LICENSE.txt).
