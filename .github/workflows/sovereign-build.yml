@@ -99,7 +99,15 @@ jobs:
           git config user.email 'sovereign-ci@users.noreply.github.com'
 
       - name: Compose patch stack
-        run: sovereign/scripts/compose.sh --base '${{ steps.inputs.outputs.upstream_base }}'
+        id: compose
+        run: |
+          set -euo pipefail
+
+          sovereign/scripts/compose.sh --base '${{ steps.inputs.outputs.upstream_base }}'
+
+          composed_commit="$(git -C .git/sovereign-compose rev-parse HEAD)"
+          echo "commit=$composed_commit" >> "$GITHUB_OUTPUT"
+          echo "BUILD_SOURCEVERSION=$composed_commit" >> "$GITHUB_ENV"
 
       - name: Compute release version
         id: version
