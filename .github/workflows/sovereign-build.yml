@@ -39,6 +39,7 @@ jobs:
     env:
       VSCODE_ARCH: ${{ matrix.vscode_arch }}
       NPM_ARCH: ${{ matrix.npm_arch }}
+      VSCODE_BUILD_SKIP_EXTENSIONS_GALLERY: '1'
     steps:
       - name: Checkout Sovereign recipe branch
         uses: actions/checkout@v6

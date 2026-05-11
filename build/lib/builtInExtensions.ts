@@ -40,6 +40,7 @@ const builtInExtensions = productjson.builtInExtensions as IExtensionDefinition[
 const webBuiltInExtensions = productjson.webBuiltInExtensions as IExtensionDefinition[] || [];
 const controlFilePath = path.join(os.homedir(), '.vscode-oss-dev', 'extensions', 'control.json');
 const ENABLE_LOGGING = !process.env['VSCODE_BUILD_BUILTIN_EXTENSIONS_SILENCE_PLEASE'];
+const SKIP_EXTENSIONS_GALLERY = process.env['VSCODE_BUILD_SKIP_EXTENSIONS_GALLERY'] === '1' || process.env['SKIP_EXTENSIONS_GALLERY'] === '1';
 
 function log(...messages: string[]): void {
 	if (ENABLE_LOGGING) {
@@ -68,13 +69,18 @@ function isUpToDate(extension: IExtensionDefinition): boolean {
 	}
 }
 
+function getBuildExtensionsGalleryServiceUrl(): string | undefined {
+	return SKIP_EXTENSIONS_GALLERY ? undefined : productjson.extensionsGallery?.serviceUrl;
+}
+
 function getExtensionDownloadStream(extension: IExtensionDefinition) {
 	let input: Stream;
+	const galleryServiceUrl = getBuildExtensionsGalleryServiceUrl();
 
 	if (extension.vsix) {
 		input = ext.fromVsix(path.join(root, extension.vsix), extension);
-	} else if (productjson.extensionsGallery?.serviceUrl) {
-		input = ext.fromMarketplace(productjson.extensionsGallery.serviceUrl, extension);
+	} else if (galleryServiceUrl) {
+		input = ext.fromMarketplace(galleryServiceUrl, extension);
 	} else {
 		input = ext.fromGithub(extension);
 	}
@@ -94,7 +100,7 @@ export function getExtensionStream(extension: IExtensionDefinition) {
 }
 
 function syncMarketplaceExtension(extension: IExtensionDefinition): Stream {
-	const galleryServiceUrl = productjson.extensionsGallery?.serviceUrl;
+	const galleryServiceUrl = getBuildExtensionsGalleryServiceUrl();
 	const source = ansiColors.blue(galleryServiceUrl ? '[marketplace]' : '[github]');
 	if (isUpToDate(extension)) {
 		log(source, `${extension.name}@${extension.version}`, ansiColors.green('✔︎'));
