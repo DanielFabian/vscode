@@ -12,6 +12,16 @@ on:
         required: false
         default: false
         type: boolean
+      publish_release:
+        description: Publish a GitHub Release after both Linux archives pass
+        required: false
+        default: false
+        type: boolean
+      mark_prerelease:
+        description: Mark the published GitHub Release as a pre-release
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -42,10 +52,10 @@ jobs:
       VSCODE_QUALITY: stable
       VSCODE_BUILD_SKIP_EXTENSIONS_GALLERY: '1'
     steps:
-      - name: Checkout Sovereign recipe branch
+      - name: Checkout Sovereign recipe revision
         uses: actions/checkout@v6
         with:
-          ref: sovereign/main
+          ref: ${{ github.sha }}
           fetch-depth: 1
 
       - name: Setup Node.js
@@ -288,3 +298,182 @@ jobs:
           path: .build/sovereign-release/*
           if-no-files-found: error
           retention-days: 7
+
+  publish-release:
+    if: ${{ inputs.publish_release && github.repository != 'microsoft/vscode' }}
+    name: publish-release
+    needs: linux-archive
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout Sovereign recipe revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Compute release version
+        id: version
+        run: |
+          set -euo pipefail
+
+          upstream_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
+          if [[ -z "$upstream_base" ]]; then
+            echo 'sovereign/upstream-base is empty' >&2
+            exit 1
+          fi
+
+          mkdir -p .build/sovereign-release
+          args=(
+            --upstream-base "$upstream_base"
+            --remote origin
+            --github-output "$GITHUB_OUTPUT"
+            --json .build/sovereign-release/release-version.json
+          )
+          override='${{ inputs.release_version }}'
+          if [[ -n "$override" ]]; then
+            args+=(--override "$override")
+          fi
+
+          node sovereign/scripts/compute-release-version.mjs "${args[@]}"
+
+      - name: Download Linux x64 release artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: sovereign-linux-x64-${{ steps.version.outputs.release_version }}
+          path: .build/sovereign-release-downloads/x64
+
+      - name: Download Linux arm64 release artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: sovereign-linux-arm64-${{ steps.version.outputs.release_version }}
+          path: .build/sovereign-release-downloads/arm64
+
+      - name: Prepare release assets
+        id: assets
+        run: |
+          set -euo pipefail
+
+          release_version='${{ steps.version.outputs.release_version }}'
+          release_tag='${{ steps.version.outputs.release_tag }}'
+          input_root="$GITHUB_WORKSPACE/.build/sovereign-release-downloads"
+          asset_dir="$GITHUB_WORKSPACE/.build/sovereign-release-assets"
+          notes="$GITHUB_WORKSPACE/.build/sovereign-release-notes.md"
+          mkdir -p "$asset_dir"
+          artifact_lines=()
+
+          cmp "$input_root/x64/release-version.json" "$input_root/arm64/release-version.json"
+          cp "$input_root/x64/release-version.json" "$asset_dir/release-version.json"
+
+          for arch in x64 arm64; do
+            dir="$input_root/$arch"
+            artifact_name="code-oss-linux-$arch-$release_version.tar.gz"
+            artifact_path="$dir/$artifact_name"
+            sha_path="$artifact_path.sha256"
+            provenance_path="$dir/sovereign-provenance.json"
+
+            if [[ ! -f "$artifact_path" ]]; then
+              echo "Missing release artifact: $artifact_path" >&2
+              exit 1
+            fi
+            if [[ ! -f "$sha_path" ]]; then
+              echo "Missing SHA256 sidecar: $sha_path" >&2
+              exit 1
+            fi
+            if [[ ! -f "$provenance_path" ]]; then
+              echo "Missing provenance sidecar: $provenance_path" >&2
+              exit 1
+            fi
+
+            (
+              cd "$dir"
+              sha256sum -c "$artifact_name.sha256"
+            )
+
+            read -r artifact_sha artifact_file < "$sha_path"
+            if [[ "$artifact_file" != "$artifact_name" ]]; then
+              echo "SHA256 sidecar for $arch names '$artifact_file', expected '$artifact_name'" >&2
+              exit 1
+            fi
+
+            root_count="$(tar -tzf "$artifact_path" | awk -F/ 'NF && !seen[$1]++ { count++ } END { print count + 0 }')"
+            if [[ "$root_count" != '1' ]]; then
+              echo "Expected $artifact_name to contain exactly one root directory, found $root_count" >&2
+              exit 1
+            fi
+
+            node - "$provenance_path" "$artifact_name" "$artifact_sha" "$release_version" <<'NODE'
+          const fs = require('fs');
+          const [provenancePath, artifactName, artifactSha, releaseVersion] = process.argv.slice(2);
+          const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+          if (provenance.releaseVersion !== releaseVersion) {
+            throw new Error(`Provenance ${provenancePath} has releaseVersion ${provenance.releaseVersion}, expected ${releaseVersion}`);
+          }
+          if (provenance.releaseTag !== releaseVersion) {
+            throw new Error(`Provenance ${provenancePath} has releaseTag ${provenance.releaseTag}, expected ${releaseVersion}`);
+          }
+          if (provenance.artifact?.name !== artifactName) {
+            throw new Error(`Provenance ${provenancePath} has artifact name ${provenance.artifact?.name}, expected ${artifactName}`);
+          }
+          if (provenance.artifact?.sha256 !== artifactSha) {
+            throw new Error(`Provenance ${provenancePath} has artifact sha256 ${provenance.artifact?.sha256}, expected ${artifactSha}`);
+          }
+          NODE
+
+            cp "$artifact_path" "$asset_dir/$artifact_name"
+            cp "$sha_path" "$asset_dir/$artifact_name.sha256"
+            cp "$provenance_path" "$asset_dir/sovereign-linux-$arch-$release_version.provenance.json"
+            artifact_lines+=("- \`$artifact_name\` — SHA256 \`$artifact_sha\`")
+          done
+
+          {
+            echo "# Sovereign Code $release_version"
+            echo
+            echo "Experimental Linux archive release built from Sovereign recipe commit \`$GITHUB_SHA\`."
+            echo
+            echo "This release currently uses Ubuntu 24.04 GitHub-hosted runners as its runtime baseline. Broader Linux distribution compatibility is not yet guaranteed."
+            echo
+            echo "## Artifacts"
+            printf '%s\n' "${artifact_lines[@]}"
+            echo
+            echo "## Provenance"
+            echo
+            echo "Each architecture has a \`sovereign-linux-<arch>-$release_version.provenance.json\` sidecar. \`release-version.json\` records the release lane computation."
+          } > "$notes"
+
+          {
+            echo "asset_dir=$asset_dir"
+            echo "notes=$notes"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+
+          release_version='${{ steps.version.outputs.release_version }}'
+          release_tag='${{ steps.assets.outputs.release_tag }}'
+          asset_dir='${{ steps.assets.outputs.asset_dir }}'
+          notes='${{ steps.assets.outputs.notes }}'
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$release_tag" >/dev/null 2>&1; then
+            echo "Release tag already exists: $release_tag" >&2
+            exit 1
+          fi
+
+          args=(
+            release create "$release_tag"
+            "$asset_dir"/*
+            --target "$GITHUB_SHA"
+            --title "Sovereign Code $release_version"
+            --notes-file "$notes"
+          )
+          if [[ '${{ inputs.mark_prerelease }}' == 'true' ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh "${args[@]}"
+        env:
+          GH_TOKEN: ${{ github.token }}
