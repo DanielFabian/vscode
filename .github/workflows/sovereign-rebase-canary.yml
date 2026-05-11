@@ -119,6 +119,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Import official product metadata
+        if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code == '0'
+        run: |
+          set -euo pipefail
+
+          sovereign/scripts/import-official-product-metadata.sh \
+            --repo .git/sovereign-compose \
+            --upstream-base '${{ steps.target.outputs.target_tag }}' \
+            --platform linux-x64 \
+            --quality stable
+
       - name: Report canary success
         if: steps.target.outputs.should_run == 'true' && steps.compose.outputs.exit_code == '0'
         continue-on-error: true

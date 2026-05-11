@@ -109,6 +109,16 @@ jobs:
           echo "commit=$composed_commit" >> "$GITHUB_OUTPUT"
           echo "BUILD_SOURCEVERSION=$composed_commit" >> "$GITHUB_ENV"
 
+      - name: Import official product metadata
+        run: |
+          set -euo pipefail
+
+          sovereign/scripts/import-official-product-metadata.sh \
+            --repo .git/sovereign-compose \
+            --upstream-base '${{ steps.inputs.outputs.upstream_base }}' \
+            --platform 'linux-${{ matrix.vscode_arch }}' \
+            --quality stable
+
       - name: Compute release version
         id: version
         run: |
