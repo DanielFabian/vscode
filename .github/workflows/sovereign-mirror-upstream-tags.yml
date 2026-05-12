@@ -37,6 +37,12 @@ jobs:
           upstream_url='https://github.com/microsoft/vscode.git'
           current_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
 
+          # Sovereign mirrors upstream release Git refs so compose/canary can use
+          # tag objects locally. We intentionally do not mirror Microsoft-owned
+          # Git LFS payloads such as Copilot simulation caches; release builds
+          # only need the pointer files for those test assets.
+          git config --local lfs.allowincompletepush true
+
           version_ge() {
             local lhs="$1"
             local rhs="$2"
