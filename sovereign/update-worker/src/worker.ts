@@ -20,9 +20,9 @@ const MANIFEST_URL = 'https://raw.githubusercontent.com/DanielFabian/vscode/mani
 const ALLOWED_PLATFORMS = new Set(['linux-x64', 'linux-arm64']);
 const ALLOWED_QUALITIES = new Set(['stable']);
 
-// Matches GET /api/update/<platform>/<quality>/<commit> with an optional trailing slash.
+// Matches GET /api/update/<platform>/<quality>/<40-hex-commit> with an optional trailing slash.
 // Querystring (background, internalOrg) is matched on URL.pathname only and ignored.
-const ROUTE = /^\/api\/update\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+const ROUTE = /^\/api\/update\/([^/]+)\/([^/]+)\/([0-9a-f]{40})\/?$/;
 
 const CACHE_HEADERS = { 'cache-control': 'public, max-age=60' } as const;
 

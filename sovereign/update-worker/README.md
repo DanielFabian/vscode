@@ -64,7 +64,7 @@ Manifest shape:
 npm install
 npm run typecheck
 npm run dev    # wrangler dev, serves on http://localhost:8787
-curl http://localhost:8787/api/update/linux-x64/stable/deadbeef
+curl http://localhost:8787/api/update/linux-x64/stable/0000000000000000000000000000000000000000
 ```
 
 ## Deploy
@@ -85,7 +85,7 @@ dashboard.
 - No KV / D1 / Durable Objects. The manifest is the only state and it
   lives in git.
 - No `/api/latest` debug endpoint. Validation hits the real route with a
-  known-stale commit and asserts the JSON's `version`.
+  known-stale 40-hex commit and asserts the JSON's `version`.
 - No request logging. Cloudflare analytics gives volume/error rate
   without a privacy story.
 - No version comparison. The protocol is pure equality on `commit`.
