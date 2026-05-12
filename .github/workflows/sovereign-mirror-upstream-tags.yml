@@ -30,18 +30,18 @@ jobs:
           ref: sovereign/main
           fetch-depth: 1
 
-      - name: Mirror semver upstream tags
+      - name: Dispatch canary for new upstream tags
         run: |
           set -euo pipefail
 
           upstream_url='https://github.com/microsoft/vscode.git'
           current_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
 
-          # Sovereign mirrors upstream release Git refs so compose/canary can use
-          # tag objects locally. We intentionally do not mirror Microsoft-owned
-          # Git LFS payloads such as Copilot simulation caches; release builds
-          # only need the pointer files for those test assets.
-          git config --local lfs.allowincompletepush true
+          # Canary fetches upstream tags directly from microsoft/vscode. Do not
+          # mirror those tag refs into this repository: GitHub rejects refs that
+          # introduce Microsoft-owned Git LFS objects we intentionally do not
+          # mirror. Instead, record seen upstream tags with no-LFS marker
+          # branches that point at sovereign/main.
 
           version_ge() {
             local lhs="$1"
@@ -67,31 +67,27 @@ jobs:
               | sort -V
           )
 
-          mirrored=0
+          dispatched=0
           for tag in "${upstream_tags[@]}"; do
             if ! is_upstream_release_tag "$tag"; then
               continue
             fi
 
-            if ! version_ge "$tag" "$current_base"; then
+            if ! version_gt "$tag" "$current_base"; then
               continue
             fi
 
-            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            marker_ref="refs/heads/sovereign/upstream-seen/$tag"
+            if git ls-remote --exit-code --heads origin "$marker_ref" >/dev/null 2>&1; then
               continue
             fi
 
-            echo "Mirroring upstream tag $tag"
-            git fetch --depth=1 "$upstream_url" "refs/tags/$tag:refs/tags/$tag"
-            git -c core.hooksPath=/dev/null push origin "refs/tags/$tag"
-            mirrored=$((mirrored + 1))
-
-            if version_gt "$tag" "$current_base"; then
-              echo "Dispatching Sovereign canary for $tag"
-              gh workflow run sovereign-rebase-canary.yml --ref sovereign/main -f "target_tag=$tag"
-            fi
+            echo "Dispatching Sovereign canary for upstream tag $tag"
+            gh workflow run sovereign-rebase-canary.yml --ref sovereign/main -f "target_tag=$tag"
+            git push origin "HEAD:$marker_ref"
+            dispatched=$((dispatched + 1))
           done
 
-          echo "Mirrored $mirrored new tag(s)."
+          echo "Dispatched canary for $dispatched new upstream tag(s)."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
