@@ -477,3 +477,40 @@ jobs:
           gh "${args[@]}"
         env:
           GH_TOKEN: ${{ github.token }}
+
+  report-build-result:
+    if: ${{ always() && inputs.publish_release && github.repository != 'microsoft/vscode' }}
+    name: report-build-result
+    needs:
+      - linux-archive
+      - publish-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout Sovereign recipe revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Report release build result
+        run: |
+          set -euo pipefail
+
+          if [[ "$REPORT_BUILD_LINUX_ARCHIVE_RESULT" == 'success' && "$REPORT_BUILD_PUBLISH_RELEASE_RESULT" == 'success' ]]; then
+            sovereign/scripts/report-build.sh success
+          else
+            sovereign/scripts/report-build.sh failure
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT_BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT_BUILD_REF: ${{ github.ref }}
+          REPORT_BUILD_SHA: ${{ github.sha }}
+          REPORT_BUILD_RELEASE_VERSION_INPUT: ${{ inputs.release_version }}
+          REPORT_BUILD_LINUX_ARCHIVE_RESULT: ${{ needs.linux-archive.result }}
+          REPORT_BUILD_PUBLISH_RELEASE_RESULT: ${{ needs.publish-release.result }}
+          REPORT_BUILD_VERIFY_MARKETPLACE: ${{ inputs.verify_marketplace }}
+          REPORT_BUILD_MARK_PRERELEASE: ${{ inputs.mark_prerelease }}
