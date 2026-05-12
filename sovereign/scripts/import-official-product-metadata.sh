@@ -23,13 +23,14 @@ while [[ $# -gt 0 ]]; do
 Usage: sovereign/scripts/import-official-product-metadata.sh \
   --repo <composed-repo> \
   --upstream-base <semver-tag> \
-  [--platform linux-x64|linux-arm64] \
+	[--platform linux-x64|linux-arm64] \
   [--quality stable]
 
 Copies selected product metadata from the official VS Code archive for the
 matching upstream release into the composed Sovereign worktree. This keeps
-upstream-owned product metadata (currently extensionEnabledApiProposals) out of
-long-lived topic diffs while still making official Marketplace extensions work.
+upstream-owned product metadata (currently extensionEnabledApiProposals and
+win32ContextMenu) out of long-lived topic diffs while still making official
+Marketplace extensions and Windows packaging work.
 USAGE
 			exit 0
 			;;
@@ -75,7 +76,14 @@ if (!proposals || typeof proposals !== 'object' || Object.keys(proposals).length
 }
 
 target.extensionEnabledApiProposals = proposals;
+const copied = [`extensionEnabledApiProposals for ${Object.keys(proposals).length} extension(s)`];
+
+if (official.win32ContextMenu && typeof official.win32ContextMenu === 'object') {
+	target.win32ContextMenu = official.win32ContextMenu;
+	copied.push('win32ContextMenu');
+}
+
 fs.writeFileSync(targetPath, `${JSON.stringify(target, null, '\t')}\n`);
 
-console.log(`import-official-product-metadata: copied extensionEnabledApiProposals for ${Object.keys(proposals).length} extension(s)`);
+console.log(`import-official-product-metadata: copied ${copied.join(', ')}`);
 NODE

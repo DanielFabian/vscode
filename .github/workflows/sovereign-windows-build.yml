@@ -1,0 +1,256 @@
+name: Sovereign Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Optional explicit Sovereign release version override
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sovereign-build-windows
+  cancel-in-progress: false
+
+jobs:
+  win32-x64-user-setup:
+    if: github.repository != 'microsoft/vscode'
+    name: win32-x64-user-setup
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      VSCODE_ARCH: x64
+      NPM_ARCH: x64
+      VSCODE_QUALITY: stable
+      VSCODE_BUILD_SKIP_EXTENSIONS_GALLERY: '1'
+    steps:
+      - name: Checkout Sovereign recipe revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Fetch release inputs
+        id: inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_base="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' sovereign/upstream-base)"
+          if [[ -z "$upstream_base" ]]; then
+            echo 'sovereign/upstream-base is empty' >&2
+            exit 1
+          fi
+
+          upstream_url='https://github.com/microsoft/vscode.git'
+          git fetch --depth=1 "$upstream_url" "refs/tags/$upstream_base:refs/tags/$upstream_base"
+          git fetch --depth=100 --prune origin \
+            '+refs/heads/topic/*:refs/heads/topic/*' \
+            '+refs/heads/topic-base/*:refs/heads/topic-base/*'
+
+          echo "upstream_base=$upstream_base" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Git committer
+        shell: bash
+        run: |
+          git config user.name 'Sovereign CI'
+          git config user.email 'sovereign-ci@users.noreply.github.com'
+
+      - name: Compose patch stack
+        id: compose
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sovereign/scripts/compose.sh --base '${{ steps.inputs.outputs.upstream_base }}'
+
+          composed_commit="$(git -C .git/sovereign-compose rev-parse HEAD)"
+          echo "commit=$composed_commit" >> "$GITHUB_OUTPUT"
+          echo "BUILD_SOURCEVERSION=$composed_commit" >> "$GITHUB_ENV"
+
+      - name: Import official product metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sovereign/scripts/import-official-product-metadata.sh \
+            --repo .git/sovereign-compose \
+            --upstream-base '${{ steps.inputs.outputs.upstream_base }}' \
+            --platform linux-x64 \
+            --quality stable
+
+      - name: Verify Windows product metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('.git/sovereign-compose/product.json','utf8')); const clsid=p.win32ContextMenu?.x64?.clsid; if (!clsid) { throw new Error('Missing win32ContextMenu.x64.clsid after official metadata import'); } console.log('win32ContextMenu.x64.clsid=' + clsid);"
+
+      - name: Compute release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .build/sovereign-windows
+          args=(
+            --upstream-base '${{ steps.inputs.outputs.upstream_base }}'
+            --remote origin
+            --github-output "$GITHUB_OUTPUT"
+            --json .build/sovereign-windows/release-version.json
+          )
+          override='${{ inputs.release_version }}'
+          if [[ -n "$override" ]]; then
+            args+=(--override "$override")
+          fi
+
+          node sovereign/scripts/compute-release-version.mjs "${args[@]}"
+
+      - name: Install dependencies
+        working-directory: .git/sovereign-compose
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          npm ci
+        env:
+          npm_config_arch: ${{ env.NPM_ARCH }}
+          npm_config_foreground_scripts: 'true'
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply build-time release version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          node sovereign/scripts/apply-release-version.mjs `
+            --repo .git/sovereign-compose `
+            --version '${{ steps.version.outputs.release_version }}'
+
+      - name: Prepare Windows packaging inputs
+        working-directory: .git/sovereign-compose
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          npm run copy-policy-dto --prefix build
+          node build/lib/policies/policyGenerator.ts build/lib/policies/policyData.jsonc win32
+          node build/win32/explorer-dll-fetcher.ts .build/win32/appx
+        env:
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+
+      - name: Build Windows x64 app tree
+        working-directory: .git/sovereign-compose
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          npm run electron x64
+          npm run gulp vscode-win32-x64-min
+          npm run gulp vscode-win32-x64-inno-updater
+        env:
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+          npm_config_arch: ${{ env.NPM_ARCH }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Windows 11 context-menu appx
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdk = Get-ChildItem -Path $sdkRoot -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64' } |
+            Where-Object { Test-Path (Join-Path $_ 'makeappx.exe') } |
+            Select-Object -First 1
+          if (-not $sdk) {
+            throw "Unable to find makeappx.exe under $sdkRoot"
+          }
+          $env:PATH = "$sdk;$env:PATH"
+
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE '.git\VSCode-win32-x64'
+          $manifestDir = Join-Path $buildDir 'appx\manifest'
+          $appxName = if ($env:VSCODE_QUALITY -eq 'stable') { 'code' } else { 'code_insider' }
+          $appxPath = Join-Path $buildDir "appx\${appxName}_$env:VSCODE_ARCH.appx"
+
+          makeappx pack /d "$manifestDir" /p "$appxPath" /nv
+          Remove-Item -Path $manifestDir -Recurse -Force
+        env:
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+          VSCODE_QUALITY: ${{ env.VSCODE_QUALITY }}
+
+      - name: Build Windows x64 user setup
+        working-directory: .git/sovereign-compose
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          npm run gulp vscode-win32-x64-user-setup
+        env:
+          VSCODE_ARCH: ${{ env.VSCODE_ARCH }}
+
+      - name: Package setup artifact
+        id: artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE '.build\sovereign-windows'
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+          $setupSource = Join-Path $env:GITHUB_WORKSPACE '.git\sovereign-compose\.build\win32-x64\user-setup\VSCodeSetup.exe'
+          if (-not (Test-Path $setupSource)) {
+            throw "Expected setup output missing: $setupSource"
+          }
+
+          $artifactName = 'CodeOSSUserSetup-x64-${{ steps.version.outputs.release_version }}.exe'
+          $artifactPath = Join-Path $releaseDir $artifactName
+          Copy-Item -Path $setupSource -Destination $artifactPath -Force
+
+          $sha256 = (Get-FileHash -Algorithm SHA256 -Path $artifactPath).Hash.ToLowerInvariant()
+          Set-Content -Path "$artifactPath.sha256" -Value "$sha256  $artifactName`n" -NoNewline
+          $provenancePath = Join-Path $releaseDir 'sovereign-win32-x64-user-setup-provenance.json'
+
+          node sovereign/scripts/write-release-provenance.mjs `
+            --repo .git/sovereign-compose `
+            --release-version '${{ steps.version.outputs.release_version }}' `
+            --upstream-base '${{ steps.inputs.outputs.upstream_base }}' `
+            --artifact "$artifactPath" `
+            --sha256 "$sha256" `
+            --output "$provenancePath"
+
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+          "sha256=$sha256" >> $env:GITHUB_OUTPUT
+
+      - name: Verify packaged Windows product metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $productPath = Join-Path $env:GITHUB_WORKSPACE '.git\VSCode-win32-x64\resources\app\product.json'
+          node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); const expected={applicationName:'code-oss', dataFolderName:'.vscode-oss', urlProtocol:'code-oss', quality:'stable', updateUrl:'https://updates.rueschegg.integral-it.ch'}; for (const [key,value] of Object.entries(expected)) { if (p[key] !== value) { throw new Error(key + ' expected ' + value + ' but got ' + p[key]); } } console.log(JSON.stringify({applicationName:p.applicationName, quality:p.quality, commit:p.commit, updateUrl:p.updateUrl}, null, 2));" "$productPath"
+
+      - name: Upload Windows user setup artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sovereign-win32-x64-user-setup-${{ steps.version.outputs.release_version }}
+          path: .build/sovereign-windows/*
+          if-no-files-found: error
+          retention-days: 7
