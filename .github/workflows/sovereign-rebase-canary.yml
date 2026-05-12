@@ -164,7 +164,7 @@ jobs:
           git push origin HEAD:sovereign/main
           echo 'promoted=true' >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch release build
+      - name: Dispatch release builds
         if: steps.target.outputs.should_run == 'true' && steps.target.outputs.is_newer == 'true' && steps.compose.outputs.exit_code == '0' && steps.promote.outputs.promoted == 'true'
         run: |
           set -euo pipefail
@@ -174,6 +174,9 @@ jobs:
             --field publish_release=true \
             --field mark_prerelease=true \
             --field verify_marketplace=false
+
+          gh workflow run sovereign-windows-build.yml \
+            --ref sovereign/main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
