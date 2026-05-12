@@ -6,7 +6,7 @@ compatibility_date = "2026-05-01"
 # Listed here for documentation; deploy with `wrangler deploy` after the
 # domain has been bound once.
 routes = [
-  { pattern = "updates.rueschegg.integral-it.ch/*", custom_domain = true }
+  { pattern = "updates.rueschegg.integral-it.ch", custom_domain = true }
 ]
 
 # No KV, no D1, no secrets. The manifest lives in git on the `manifest` branch.
