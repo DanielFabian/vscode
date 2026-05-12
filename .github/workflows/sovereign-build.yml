@@ -532,6 +532,89 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Validate update endpoint
+        run: |
+          set -euo pipefail
+
+          manifest_path="$GITHUB_WORKSPACE/.build/sovereign-update-manifest/manifest.json"
+          node - "$manifest_path" <<'NODE'
+          const fs = require('fs');
+
+          const manifestPath = process.argv[2];
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          const endpoint = 'https://updates.rueschegg.integral-it.ch/api/update';
+          const staleCommit = '0000000000000000000000000000000000000000';
+          const quality = 'stable';
+          const platforms = ['linux-x64', 'linux-arm64'];
+
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function waitFor(label, fn) {
+            let last;
+            for (let attempt = 1; attempt <= 12; attempt++) {
+              try {
+                await fn(attempt);
+                return;
+              } catch (error) {
+                last = error;
+                console.log(`${label}: attempt ${attempt} failed: ${error.message}`);
+                if (attempt < 12) {
+                  await sleep(10_000);
+                }
+              }
+            }
+            throw last;
+          }
+
+          async function readBody(response) {
+            const text = await response.text();
+            if (!text) {
+              return undefined;
+            }
+            try {
+              return JSON.parse(text);
+            } catch (error) {
+              throw new Error(`response was not JSON: ${error.message}: ${text.slice(0, 200)}`);
+            }
+          }
+
+          function assertEqual(label, actual, expected) {
+            if (actual !== expected) {
+              throw new Error(`${label}: got ${actual}, expected ${expected}`);
+            }
+          }
+
+          async function main() {
+            for (const platform of platforms) {
+              const entry = manifest.channels?.[quality]?.[platform];
+              if (!entry) {
+                throw new Error(`Manifest is missing ${quality}/${platform}`);
+              }
+
+              await waitFor(`${platform} stale update`, async () => {
+                const response = await fetch(`${endpoint}/${platform}/${quality}/${staleCommit}`);
+                assertEqual(`${platform} stale status`, response.status, 200);
+                const update = await readBody(response);
+                assertEqual(`${platform} stale version`, update?.version, entry.version);
+                assertEqual(`${platform} stale productVersion`, update?.productVersion, entry.productVersion);
+                assertEqual(`${platform} stale sha256hash`, update?.sha256hash, entry.sha256hash);
+              });
+
+              await waitFor(`${platform} current update`, async () => {
+                const response = await fetch(`${endpoint}/${platform}/${quality}/${entry.version}`);
+                assertEqual(`${platform} current status`, response.status, 204);
+              });
+
+              console.log(`${platform}: update endpoint validated for ${entry.productVersion} (${entry.version})`);
+            }
+          }
+
+          main().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
   report-build-result:
     if: ${{ always() && inputs.publish_release && github.repository != 'microsoft/vscode' }}
     name: report-build-result
