@@ -183,8 +183,11 @@ function fromLocalEsbuild(extensionPath: string, esbuildConfigFileName: string):
 			fancyLog(`${ansiColors.green('esbuilding')}: ${data.toString('utf8')}`);
 		});
 	}).then(() => {
-		// After esbuild completes, collect all files using vsce
-		return vsce.listFiles({ cwd: extensionPath, packageManager: vsce.PackageManager.None });
+		// After esbuild completes, collect all files using vsce.
+		// Copilot's .vscodeignore intentionally allowlists a small runtime subset of node_modules.
+		// Let vsce resolve that subset instead of later copying every production dependency.
+		const packageManager = extensionName === 'copilot' ? vsce.PackageManager.Npm : vsce.PackageManager.None;
+		return vsce.listFiles({ cwd: extensionPath, packageManager });
 	}).then(fileNames => {
 		if (packagedDependencies.length > 0) {
 			const packagedDependencyFileNames = packagedDependencies.flatMap(dependency =>
@@ -471,19 +474,9 @@ export function packageCopilotExtensionStream(disableMangle: boolean): Stream {
 		return es.readArray([]);
 	}
 
-	const localExtensionsStream = minifyExtensionResources(
+	return minifyExtensionResources(
 		fromLocal(extensionPath, false, disableMangle)
 			.pipe(rename(p => p.dirname = `extensions/copilot/${p.dirname}`))
-	);
-
-	const productionDependencies = getProductionDependencies('extensions/copilot');
-	const dependenciesSrc = productionDependencies.map(d => path.relative(root, d)).map(d => [`${d}/**`, `!${d}/**/{test,tests}/**`]).flat();
-
-	return es.merge(
-		localExtensionsStream,
-		gulp.src(dependenciesSrc, { base: '.' })
-			.pipe(util2.cleanNodeModules(path.join(root, 'build', '.moduleignore')))
-			.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`)))
 	).pipe(util2.setExecutableBit(['**/*.sh']));
 }
 
