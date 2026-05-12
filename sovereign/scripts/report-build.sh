@@ -52,6 +52,7 @@ write_failure_body() {
 		echo "| Release version input | \`${REPORT_BUILD_RELEASE_VERSION_INPUT:-<auto>}\` |"
 		echo "| linux-archive result | \`${REPORT_BUILD_LINUX_ARCHIVE_RESULT:-unknown}\` |"
 		echo "| publish-release result | \`${REPORT_BUILD_PUBLISH_RELEASE_RESULT:-unknown}\` |"
+		echo "| publish-update-manifest result | \`${REPORT_BUILD_PUBLISH_UPDATE_MANIFEST_RESULT:-unknown}\` |"
 		echo "| verify_marketplace | \`${REPORT_BUILD_VERIFY_MARKETPLACE:-unknown}\` |"
 		echo "| mark_prerelease | \`${REPORT_BUILD_MARK_PRERELEASE:-unknown}\` |"
 		echo

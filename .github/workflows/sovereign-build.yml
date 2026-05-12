@@ -307,6 +307,9 @@ jobs:
     permissions:
       actions: read
       contents: write
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+      release_tag: ${{ steps.assets.outputs.release_tag }}
     steps:
       - name: Checkout Sovereign recipe revision
         uses: actions/checkout@v6
@@ -478,12 +481,64 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  publish-update-manifest:
+    if: ${{ inputs.publish_release && github.repository != 'microsoft/vscode' }}
+    name: publish-update-manifest
+    needs: publish-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Sovereign recipe revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Publish update manifest
+        run: |
+          set -euo pipefail
+
+          release_version='${{ needs.publish-release.outputs.release_version }}'
+          release_tag='${{ needs.publish-release.outputs.release_tag }}'
+          manifest_worktree="$GITHUB_WORKSPACE/.build/sovereign-update-manifest"
+
+          git config user.name 'Sovereign CI'
+          git config user.email 'sovereign-ci@users.noreply.github.com'
+
+          rm -rf "$manifest_worktree"
+          if git ls-remote --exit-code --heads origin manifest >/dev/null 2>&1; then
+            git fetch --depth=1 origin '+refs/heads/manifest:refs/remotes/origin/manifest'
+            git worktree add -B manifest "$manifest_worktree" refs/remotes/origin/manifest
+          else
+            git worktree add --orphan -b manifest "$manifest_worktree"
+          fi
+
+          node sovereign/scripts/write-update-manifest.mjs \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --release-tag "$release_tag" \
+            --quality stable \
+            --output "$manifest_worktree/manifest.json"
+
+          git -C "$manifest_worktree" add manifest.json
+          if git -C "$manifest_worktree" diff --cached --quiet -- manifest.json; then
+            echo 'Update manifest unchanged'
+            exit 0
+          fi
+
+          git -C "$manifest_worktree" diff --cached -- manifest.json
+          git -C "$manifest_worktree" commit -m "Promote Sovereign Code $release_version to stable"
+          git -C "$manifest_worktree" push origin HEAD:manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   report-build-result:
     if: ${{ always() && inputs.publish_release && github.repository != 'microsoft/vscode' }}
     name: report-build-result
     needs:
       - linux-archive
       - publish-release
+      - publish-update-manifest
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -499,7 +554,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$REPORT_BUILD_LINUX_ARCHIVE_RESULT" == 'success' && "$REPORT_BUILD_PUBLISH_RELEASE_RESULT" == 'success' ]]; then
+          if [[ "$REPORT_BUILD_LINUX_ARCHIVE_RESULT" == 'success' && "$REPORT_BUILD_PUBLISH_RELEASE_RESULT" == 'success' && "$REPORT_BUILD_PUBLISH_UPDATE_MANIFEST_RESULT" == 'success' ]]; then
             sovereign/scripts/report-build.sh success
           else
             sovereign/scripts/report-build.sh failure
@@ -512,5 +567,6 @@ jobs:
           REPORT_BUILD_RELEASE_VERSION_INPUT: ${{ inputs.release_version }}
           REPORT_BUILD_LINUX_ARCHIVE_RESULT: ${{ needs.linux-archive.result }}
           REPORT_BUILD_PUBLISH_RELEASE_RESULT: ${{ needs.publish-release.result }}
+          REPORT_BUILD_PUBLISH_UPDATE_MANIFEST_RESULT: ${{ needs.publish-update-manifest.result }}
           REPORT_BUILD_VERIFY_MARKETPLACE: ${{ inputs.verify_marketplace }}
           REPORT_BUILD_MARK_PRERELEASE: ${{ inputs.mark_prerelease }}
