@@ -1,0 +1,21 @@
+{
+	"schemaVersion": 1,
+	"channels": {
+		"stable": {
+			"linux-x64": {
+				"url": "https://github.com/DanielFabian/vscode/releases/download/1.119.10001/code-oss-linux-x64-1.119.10001.tar.gz",
+				"version": "33eb1c0c15e9b3ff7b19e515092fec8e5207bfb9",
+				"productVersion": "1.119.10001",
+				"sha256hash": "c58cb8a88ccdbfd79c5f800c5cba5ad5dbe402702dbbec08525d79095aa6de97",
+				"timestamp": 1778532501000
+			},
+			"linux-arm64": {
+				"url": "https://github.com/DanielFabian/vscode/releases/download/1.119.10001/code-oss-linux-arm64-1.119.10001.tar.gz",
+				"version": "88bcd3db1b494e92ba9f6234cad6553aec31b32f",
+				"productVersion": "1.119.10001",
+				"sha256hash": "68b30d8905f8383ae51919e4c829e2297046692d34f30bc3374af05114f33843",
+				"timestamp": 1778532501000
+			}
+		}
+	}
+}
