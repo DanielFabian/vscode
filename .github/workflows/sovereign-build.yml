@@ -343,13 +343,13 @@ jobs:
           node sovereign/scripts/compute-release-version.mjs "${args[@]}"
 
       - name: Download Linux x64 release artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: sovereign-linux-x64-${{ steps.version.outputs.release_version }}
           path: .build/sovereign-release-downloads/x64
 
       - name: Download Linux arm64 release artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: sovereign-linux-arm64-${{ steps.version.outputs.release_version }}
           path: .build/sovereign-release-downloads/arm64
